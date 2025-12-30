@@ -55,6 +55,15 @@ func (t *bptree) findLeaf(key []byte) *bpnode {
 	return n
 }
 
+func (t *bptree) snapshot() *bptree {
+	if t == nil || t.root == nil {
+		return newBPTree(defaultOrder, nil)
+	}
+	root := cloneNode(t.root)
+	linkLeaves(root)
+	return &bptree{root: root, order: t.order}
+}
+
 type pathElem struct {
 	node *bpnode
 	idx  int
@@ -245,6 +254,44 @@ func removeChild(parent *bpnode, idx int) {
 	} else {
 		removeAt(&parent.keys, len(parent.keys)-1)
 	}
+}
+
+func cloneNode(n *bpnode) *bpnode {
+	if n == nil {
+		return nil
+	}
+	out := &bpnode{isLeaf: n.isLeaf}
+	out.keys = append(out.keys, n.keys...)
+	if n.isLeaf {
+		out.values = append(out.values, n.values...)
+		return out
+	}
+	out.children = make([]*bpnode, len(n.children))
+	for i, child := range n.children {
+		out.children[i] = cloneNode(child)
+	}
+	return out
+}
+
+func linkLeaves(root *bpnode) {
+	var prev *bpnode
+	var walk func(n *bpnode)
+	walk = func(n *bpnode) {
+		if n == nil {
+			return
+		}
+		if n.isLeaf {
+			if prev != nil {
+				prev.next = n
+			}
+			prev = n
+			return
+		}
+		for _, child := range n.children {
+			walk(child)
+		}
+	}
+	walk(root)
 }
 
 func cloneBytes(b []byte) []byte {
