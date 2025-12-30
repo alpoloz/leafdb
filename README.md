@@ -44,6 +44,33 @@ func main() {
 }
 ```
 
+## Transactions
+
+```go
+err := db.View(func(tx *leafdb.Tx) error {
+	val, ok := tx.Get([]byte("name"))
+	if !ok {
+		return nil
+	}
+	fmt.Printf("name=%s\n", val)
+	return nil
+})
+if err != nil {
+	log.Fatalf("view failed: %v", err)
+}
+
+err = db.Update(func(tx *leafdb.Tx) error {
+	if err := tx.Set([]byte("name"), []byte("leaf")); err != nil {
+		return err
+	}
+	_, err := tx.Delete([]byte("old"))
+	return err
+})
+if err != nil {
+	log.Fatalf("update failed: %v", err)
+}
+```
+
 ## Example app
 Run the bundled example:
 
