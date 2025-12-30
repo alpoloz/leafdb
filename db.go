@@ -37,7 +37,7 @@ func Open(path string) (*DB, error) {
 
 // OpenWithOptions creates or opens a database file with persistence options.
 func OpenWithOptions(path string, opts *Options) (*DB, error) {
-	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o644)
+	file, err := openFile(path)
 	if err != nil {
 		return nil, err
 	}
