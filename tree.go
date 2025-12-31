@@ -28,6 +28,11 @@ type node struct {
 	next     uint64
 }
 
+type cursorFrame struct {
+	node  *node
+	index int
+}
+
 func newBPTree(root *uint64, store pageStore) *bptree {
 	return &bptree{root: root, store: store}
 }
@@ -45,7 +50,7 @@ func (t *bptree) get(key []byte) ([]byte, bool, error) {
 }
 
 func (t *bptree) set(key, value []byte) error {
-	promoted, right, split, err := t.insert(*t.root, key, value)
+	newID, promoted, rightID, split, err := t.insert(*t.root, key, value)
 	if err != nil {
 		return err
 	}
@@ -55,7 +60,7 @@ func (t *bptree) set(key, value []byte) error {
 			pageID:   rootID,
 			isLeaf:   false,
 			keys:     [][]byte{promoted},
-			children: []uint64{*t.root, right},
+			children: []uint64{newID, rightID},
 		}
 		buf, err := encodeNodePage(t.store.PageSize(), root)
 		if err != nil {
@@ -65,26 +70,30 @@ func (t *bptree) set(key, value []byte) error {
 			return err
 		}
 		*t.root = rootID
+		return nil
 	}
+	*t.root = newID
 	return nil
 }
 
 func (t *bptree) delete(key []byte) (bool, error) {
-	leaf, err := t.findLeaf(key)
+	newID, deleted, err := t.deleteRecursive(*t.root, key)
 	if err != nil {
 		return false, err
 	}
-	idx, ok := findKeyIndex(leaf.keys, key)
-	if !ok {
+	if !deleted {
 		return false, nil
 	}
-	removeAt(&leaf.keys, idx)
-	removeAt(&leaf.values, idx)
-	buf, err := encodeNodePage(t.store.PageSize(), leaf)
+	root, err := readNode(t.store, newID)
 	if err != nil {
 		return false, err
 	}
-	return true, t.store.WritePage(leaf.pageID, buf)
+	if root != nil && !root.isLeaf && len(root.keys) == 0 && len(root.children) == 1 {
+		*t.root = root.children[0]
+		return true, nil
+	}
+	*t.root = newID
+	return true, nil
 }
 
 func (t *bptree) findLeaf(key []byte) (*node, error) {
@@ -116,53 +125,68 @@ func (t *bptree) firstLeaf() (*node, error) {
 	}
 }
 
-func (t *bptree) insert(pageID uint64, key, value []byte) ([]byte, uint64, bool, error) {
+func (t *bptree) insert(pageID uint64, key, value []byte) (uint64, []byte, uint64, bool, error) {
 	n, err := readNode(t.store, pageID)
 	if err != nil {
-		return nil, 0, false, err
+		return 0, nil, 0, false, err
 	}
 	if n.isLeaf {
-		idx, exists := findKeyIndex(n.keys, key)
+		newNode := cloneNode(n)
+		newNode.pageID = t.store.AllocPage()
+		idx, exists := findKeyIndex(newNode.keys, key)
 		if exists {
-			n.values[idx] = cloneBytes(value)
-			buf, err := encodeNodePage(t.store.PageSize(), n)
+			newNode.values[idx] = cloneBytes(value)
+			buf, err := encodeNodePage(t.store.PageSize(), newNode)
 			if err != nil {
-				return nil, 0, false, err
+				return 0, nil, 0, false, err
 			}
-			return nil, 0, false, t.store.WritePage(n.pageID, buf)
+			if err := t.store.WritePage(newNode.pageID, buf); err != nil {
+				return 0, nil, 0, false, err
+			}
+			return newNode.pageID, nil, 0, false, nil
 		}
-		insertAt(&n.keys, idx, cloneBytes(key))
-		insertAt(&n.values, idx, cloneBytes(value))
-		if nodeFits(t.store.PageSize(), n) {
-			buf, err := encodeNodePage(t.store.PageSize(), n)
+		insertAt(&newNode.keys, idx, cloneBytes(key))
+		insertAt(&newNode.values, idx, cloneBytes(value))
+		if nodeFits(t.store.PageSize(), newNode) {
+			buf, err := encodeNodePage(t.store.PageSize(), newNode)
 			if err != nil {
-				return nil, 0, false, err
+				return 0, nil, 0, false, err
 			}
-			return nil, 0, false, t.store.WritePage(n.pageID, buf)
+			if err := t.store.WritePage(newNode.pageID, buf); err != nil {
+				return 0, nil, 0, false, err
+			}
+			return newNode.pageID, nil, 0, false, nil
 		}
-		return t.splitLeaf(n)
+		return t.splitLeaf(newNode)
 	}
 
 	idx := findChildIndex(n.keys, key)
-	promoted, rightID, split, err := t.insert(n.children[idx], key, value)
+	childID := n.children[idx]
+	newChildID, promoted, rightID, split, err := t.insert(childID, key, value)
 	if err != nil {
-		return nil, 0, false, err
+		return 0, nil, 0, false, err
 	}
+	newNode := cloneNode(n)
+	newNode.pageID = t.store.AllocPage()
+	newNode.children[idx] = newChildID
 	if split {
-		insertAt(&n.keys, idx, promoted)
-		insertAtUint64(&n.children, idx+1, rightID)
+		insertAt(&newNode.keys, idx, promoted)
+		insertAtUint64(&newNode.children, idx+1, rightID)
 	}
-	if nodeFits(t.store.PageSize(), n) {
-		buf, err := encodeNodePage(t.store.PageSize(), n)
+	if nodeFits(t.store.PageSize(), newNode) {
+		buf, err := encodeNodePage(t.store.PageSize(), newNode)
 		if err != nil {
-			return nil, 0, false, err
+			return 0, nil, 0, false, err
 		}
-		return nil, 0, false, t.store.WritePage(n.pageID, buf)
+		if err := t.store.WritePage(newNode.pageID, buf); err != nil {
+			return 0, nil, 0, false, err
+		}
+		return newNode.pageID, nil, 0, false, nil
 	}
-	return t.splitBranch(n)
+	return t.splitBranch(newNode)
 }
 
-func (t *bptree) splitLeaf(n *node) ([]byte, uint64, bool, error) {
+func (t *bptree) splitLeaf(n *node) (uint64, []byte, uint64, bool, error) {
 	mid := len(n.keys) / 2
 	right := &node{
 		pageID: t.store.AllocPage(),
@@ -178,23 +202,23 @@ func (t *bptree) splitLeaf(n *node) ([]byte, uint64, bool, error) {
 
 	leftBuf, err := encodeNodePage(t.store.PageSize(), n)
 	if err != nil {
-		return nil, 0, false, err
+		return 0, nil, 0, false, err
 	}
 	if err := t.store.WritePage(n.pageID, leftBuf); err != nil {
-		return nil, 0, false, err
+		return 0, nil, 0, false, err
 	}
 
 	rightBuf, err := encodeNodePage(t.store.PageSize(), right)
 	if err != nil {
-		return nil, 0, false, err
+		return 0, nil, 0, false, err
 	}
 	if err := t.store.WritePage(right.pageID, rightBuf); err != nil {
-		return nil, 0, false, err
+		return 0, nil, 0, false, err
 	}
-	return cloneBytes(right.keys[0]), right.pageID, true, nil
+	return n.pageID, cloneBytes(right.keys[0]), right.pageID, true, nil
 }
 
-func (t *bptree) splitBranch(n *node) ([]byte, uint64, bool, error) {
+func (t *bptree) splitBranch(n *node) (uint64, []byte, uint64, bool, error) {
 	mid := len(n.keys) / 2
 	promoted := n.keys[mid]
 
@@ -210,21 +234,68 @@ func (t *bptree) splitBranch(n *node) ([]byte, uint64, bool, error) {
 
 	leftBuf, err := encodeNodePage(t.store.PageSize(), n)
 	if err != nil {
-		return nil, 0, false, err
+		return 0, nil, 0, false, err
 	}
 	if err := t.store.WritePage(n.pageID, leftBuf); err != nil {
-		return nil, 0, false, err
+		return 0, nil, 0, false, err
 	}
 
 	rightBuf, err := encodeNodePage(t.store.PageSize(), right)
 	if err != nil {
-		return nil, 0, false, err
+		return 0, nil, 0, false, err
 	}
 	if err := t.store.WritePage(right.pageID, rightBuf); err != nil {
-		return nil, 0, false, err
+		return 0, nil, 0, false, err
 	}
 
-	return cloneBytes(promoted), right.pageID, true, nil
+	return n.pageID, cloneBytes(promoted), right.pageID, true, nil
+}
+
+func (t *bptree) deleteRecursive(pageID uint64, key []byte) (uint64, bool, error) {
+	n, err := readNode(t.store, pageID)
+	if err != nil {
+		return 0, false, err
+	}
+	if n.isLeaf {
+		idx, ok := findKeyIndex(n.keys, key)
+		if !ok {
+			return pageID, false, nil
+		}
+		newNode := cloneNode(n)
+		newNode.pageID = t.store.AllocPage()
+		removeAt(&newNode.keys, idx)
+		removeAt(&newNode.values, idx)
+		buf, err := encodeNodePage(t.store.PageSize(), newNode)
+		if err != nil {
+			return 0, false, err
+		}
+		if err := t.store.WritePage(newNode.pageID, buf); err != nil {
+			return 0, false, err
+		}
+		return newNode.pageID, true, nil
+	}
+
+	idx := findChildIndex(n.keys, key)
+	childID := n.children[idx]
+	newChildID, deleted, err := t.deleteRecursive(childID, key)
+	if err != nil {
+		return 0, false, err
+	}
+	if !deleted {
+		return pageID, false, nil
+	}
+
+	newNode := cloneNode(n)
+	newNode.pageID = t.store.AllocPage()
+	newNode.children[idx] = newChildID
+	buf, err := encodeNodePage(t.store.PageSize(), newNode)
+	if err != nil {
+		return 0, false, err
+	}
+	if err := t.store.WritePage(newNode.pageID, buf); err != nil {
+		return 0, false, err
+	}
+	return newNode.pageID, true, nil
 }
 
 func readNode(store pageStore, pageID uint64) (*node, error) {
@@ -449,5 +520,20 @@ func cloneBytes(b []byte) []byte {
 	}
 	out := make([]byte, len(b))
 	copy(out, b)
+	return out
+}
+
+func cloneNode(n *node) *node {
+	out := &node{
+		pageID: n.pageID,
+		isLeaf: n.isLeaf,
+		next:   n.next,
+	}
+	out.keys = append(out.keys, n.keys...)
+	if n.isLeaf {
+		out.values = append(out.values, n.values...)
+		return out
+	}
+	out.children = append(out.children, n.children...)
 	return out
 }

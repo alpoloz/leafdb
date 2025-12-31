@@ -8,6 +8,8 @@ import (
 // Bucket is a namespace for key/value pairs and nested buckets.
 type Bucket struct {
 	tx         *Tx
+	name       []byte
+	parent     *Bucket
 	header     uint64
 	kvRoot     uint64
 	bucketRoot uint64
@@ -36,7 +38,7 @@ func (b *Bucket) Put(key, value []byte) error {
 	if err := tree.set(key, value); err != nil {
 		return err
 	}
-	return writeBucketHeader(b.tx.mgr, b.header, b.kvRoot, b.bucketRoot)
+	return b.persistHeader()
 }
 
 func (b *Bucket) Delete(key []byte) error {
@@ -51,7 +53,7 @@ func (b *Bucket) Delete(key []byte) error {
 	if err != nil {
 		return err
 	}
-	return writeBucketHeader(b.tx.mgr, b.header, b.kvRoot, b.bucketRoot)
+	return b.persistHeader()
 }
 
 func (b *Bucket) Bucket(name []byte) *Bucket {
@@ -71,7 +73,7 @@ func (b *Bucket) Bucket(name []byte) *Bucket {
 	if err != nil {
 		return nil
 	}
-	return &Bucket{tx: b.tx, header: pageID, kvRoot: kvRoot, bucketRoot: bucketRoot}
+	return &Bucket{tx: b.tx, name: cloneBytes(name), parent: b, header: pageID, kvRoot: kvRoot, bucketRoot: bucketRoot}
 }
 
 func (b *Bucket) CreateBucket(name []byte) (*Bucket, error) {
@@ -98,7 +100,10 @@ func (b *Bucket) CreateBucket(name []byte) (*Bucket, error) {
 	if err := tree.set(name, encodePageID(child.header)); err != nil {
 		return nil, err
 	}
-	if err := writeBucketHeader(b.tx.mgr, b.header, b.kvRoot, b.bucketRoot); err != nil {
+	child.name = cloneBytes(name)
+	child.parent = b
+
+	if err := b.persistHeader(); err != nil {
 		return nil, err
 	}
 	return child, nil
@@ -135,7 +140,7 @@ func (b *Bucket) DeleteBucket(name []byte) error {
 	}
 	bucketID := decodePageID(val)
 	b.tx.releaseBucket(bucketID)
-	return writeBucketHeader(b.tx.mgr, b.header, b.kvRoot, b.bucketRoot)
+	return b.persistHeader()
 }
 
 func (b *Bucket) Cursor() *Cursor {
@@ -143,6 +148,32 @@ func (b *Bucket) Cursor() *Cursor {
 		return nil
 	}
 	return &Cursor{tree: newBPTree(&b.kvRoot, b.tx.mgr)}
+}
+
+func (b *Bucket) persistHeader() error {
+	headID := b.tx.mgr.AllocPage()
+	if err := writeBucketHeader(b.tx.mgr, headID, b.kvRoot, b.bucketRoot); err != nil {
+		return err
+	}
+	b.header = headID
+	if b.parent == nil {
+		root := b.tx.mgr.root
+		tree := newBPTree(&root, b.tx.mgr)
+		if err := tree.set(b.name, encodePageID(headID)); err != nil {
+			return err
+		}
+		b.tx.mgr.root = root
+		return nil
+	}
+	return b.parent.updateChild(b.name, headID)
+}
+
+func (b *Bucket) updateChild(name []byte, headerID uint64) error {
+	tree := newBPTree(&b.bucketRoot, b.tx.mgr)
+	if err := tree.set(name, encodePageID(headerID)); err != nil {
+		return err
+	}
+	return b.persistHeader()
 }
 
 func readBucketHeader(store pageStore, pageID uint64) (uint64, uint64, error) {

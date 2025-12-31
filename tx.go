@@ -10,6 +10,7 @@ type Tx struct {
 	writable bool
 	closed   bool
 	mgr      *txPageManager
+	mapLock  bool
 }
 
 func (tx *Tx) Bucket(name []byte) *Bucket {
@@ -30,7 +31,7 @@ func (tx *Tx) Bucket(name []byte) *Bucket {
 	if err != nil {
 		return nil
 	}
-	return &Bucket{tx: tx, header: pageID, kvRoot: kvRoot, bucketRoot: bucketRoot}
+	return &Bucket{tx: tx, name: cloneBytes(name), header: pageID, kvRoot: kvRoot, bucketRoot: bucketRoot}
 }
 
 func (tx *Tx) CreateBucket(name []byte) (*Bucket, error) {
@@ -59,6 +60,7 @@ func (tx *Tx) CreateBucket(name []byte) (*Bucket, error) {
 		return nil, err
 	}
 	tx.mgr.root = root
+	bucket.name = cloneBytes(name)
 	return bucket, nil
 }
 
@@ -130,8 +132,8 @@ func (tx *Tx) close() {
 	tx.closed = true
 	if tx.writable {
 		tx.db.mu.Unlock()
-	} else {
-		tx.db.mu.RUnlock()
+	} else if tx.mapLock {
+		tx.db.mapMu.RUnlock()
 	}
 }
 
@@ -209,24 +211,26 @@ type txPageManager struct {
 	writable bool
 	pageSize int
 	root     uint64
+	txid     uint64
 	nextPage uint64
 	freelist []uint64
 	dirty    map[uint64][]byte
 	maxPage  uint64
 }
 
-func newTxPageManager(db *DB, writable bool) *txPageManager {
+func newTxPageManager(db *DB, writable bool, m meta) *txPageManager {
 	mgr := &txPageManager{
 		db:       db,
 		writable: writable,
 		pageSize: db.pageSize,
-		root:     db.meta.root,
-		nextPage: db.meta.nextPage,
-		freelist: append([]uint64(nil), db.meta.freelist...),
+		root:     m.root,
+		txid:     m.txid,
+		nextPage: m.nextPage,
+		freelist: append([]uint64(nil), m.freelist...),
 		dirty:    make(map[uint64][]byte),
 	}
-	if db.meta.nextPage > 0 {
-		mgr.maxPage = db.meta.nextPage - 1
+	if m.nextPage > 0 {
+		mgr.maxPage = m.nextPage - 1
 	}
 	return mgr
 }
@@ -262,11 +266,7 @@ func (m *txPageManager) WritePage(id uint64, buf []byte) error {
 }
 
 func (m *txPageManager) AllocPage() uint64 {
-	if len(m.freelist) > 0 {
-		id := m.freelist[len(m.freelist)-1]
-		m.freelist = m.freelist[:len(m.freelist)-1]
-		return id
-	}
+	// MVCC safety: avoid reusing freed pages until a GC is added.
 	id := m.nextPage
 	m.nextPage++
 	if id > m.maxPage {
@@ -276,7 +276,7 @@ func (m *txPageManager) AllocPage() uint64 {
 }
 
 func (m *txPageManager) FreePage(id uint64) {
-	if id == metaPageID {
+	if id == metaPage0 || id == metaPage1 {
 		return
 	}
 	m.freelist = append(m.freelist, id)
@@ -297,10 +297,18 @@ func (m *txPageManager) commit() error {
 		copy(m.db.page(id), buf)
 	}
 
-	m.db.meta = meta{root: m.root, nextPage: m.nextPage, freelist: m.freelist}
-	if err := writeMeta(m.db.page(metaPageID), m.db.meta, m.pageSize); err != nil {
+	newMeta := meta{txid: m.txid + 1, root: m.root, nextPage: m.nextPage, freelist: m.freelist}
+	var nextMetaPage uint64 = metaPage0
+	if m.db.metaPage == metaPage0 {
+		nextMetaPage = metaPage1
+	}
+	if err := writeMetaPage(m.db.page(nextMetaPage), newMeta, m.pageSize); err != nil {
 		return err
 	}
+	m.db.metaMu.Lock()
+	m.db.meta = newMeta
+	m.db.metaPage = nextMetaPage
+	m.db.metaMu.Unlock()
 	return m.db.data.Flush()
 }
 

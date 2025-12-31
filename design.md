@@ -14,7 +14,7 @@ file_offset = page_id * page_size
 
 ### Page Types
 
-- Meta page (page 0)
+- Meta pages (page 0 and page 1)
 - B+ tree leaf page
 - B+ tree branch page
 - Bucket header page
@@ -23,31 +23,33 @@ file_offset = page_id * page_size
 
 ```
 | Page 0 | Page 1 | Page 2 | Page 3 | ... |
-| Meta   | Root   | Free   | Data   | ... |
+| Meta0  | Meta1  | Root   | Data   | ... |
 
-Meta page (page 0):
-  - magic, page size
+Meta pages (page 0 and page 1):
+  - magic, page size, txid
   - root page id (top-level bucket index)
   - next page id
   - freelist
 
-Root page (page 1):
+Root page (page 2):
   - B+ tree node (leaf/branch) for top-level buckets
   - keys = bucket names, values = bucket header page ids
 ```
 
-### Meta Page (page 0)
+### Meta Pages (page 0 and page 1)
 
-The meta page holds file-level metadata and the freelist.
+LeafDB stores two meta pages and alternates between them on commit. Readers use
+the meta page with the highest transaction ID for snapshot isolation.
 
 ```
 Offset  Size  Field
-0       4     Magic "LDBM"
+0       4     Magic "LDB2"
 4       4     Page size (uint32, little-endian)
-8       8     Root page ID (uint64) for top-level bucket index
-16      8     Next page ID (uint64) for allocation
-24      4     Freelist count (uint32)
-28      8*N   Freelist page IDs (uint64 each)
+8       8     TxID (uint64)
+16      8     Root page ID (uint64) for top-level bucket index
+24      8     Next page ID (uint64) for allocation
+32      4     Freelist count (uint32)
+36      8*N   Freelist page IDs (uint64 each)
 ```
 
 ### Bucket Header Page
@@ -97,27 +99,29 @@ Child[0..N] (uint64 each), then Key[0..N-1] (uint16 + bytes)
 
 ## Transaction Model
 
-- Single writer, multiple readers.
-- Writer transactions take an exclusive lock and apply changes to mmap pages
-  on commit.
-- Read transactions take a shared lock and read directly from mmap.
+- Single writer, multiple readers with snapshot isolation.
+- Writer transactions take an exclusive lock and commit by writing new pages
+  and then flipping the meta page (meta0/meta1).
+- Read transactions pin the mmap during the transaction and use the meta
+  snapshot chosen at Begin time.
 
 ## Implementation Decisions
 
 - **Memory mapping**: Uses writable mmap for fast random access to pages and
   reliance on the OS page cache instead of maintaining an in-memory tree.
-- **Page-based B+ tree**: Node splits allocate new pages; updates rewrite
-  affected pages in place during commit.
+- **Copy-on-write pages**: Updates allocate new pages and never overwrite
+  existing pages, enabling snapshot reads.
 - **Separate trees per bucket**: Nested buckets are stored in a dedicated
   bucket-index tree rather than mixing bucket and KV keys.
-- **Freelist in meta page**: Simplifies allocation and deallocation, but is
-  limited by meta page capacity.
-- **Cursor iteration**: Implemented by walking leaf pages via the next pointer.
+- **Freelist in meta page**: Simplifies allocation, but currently unused for
+  reuse to preserve MVCC safety.
+- **Cursor iteration**: Implemented by walking branch paths to avoid reliance
+  on mutable leaf links.
 
 ## Alternatives and Tradeoffs
 
-- **Copy-on-write (CoW) pages**: Safer crash consistency and snapshots, but
-  requires more complex page management and space reclamation.
+- **Copy-on-write (CoW) pages**: Selected for snapshot isolation. Requires
+  background or epoch-based GC to safely reuse pages.
 - **Write-ahead log (WAL)**: Adds durability guarantees and crash recovery at
   the cost of more I/O and log compaction logic.
 - **Append-only B+ tree**: Simplifies writes and recovery but increases file

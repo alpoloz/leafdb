@@ -2,9 +2,10 @@ package leafdb
 
 // Cursor iterates over keys in a bucket.
 type Cursor struct {
-	tree   *bptree
-	leafID uint64
-	index  int
+	tree  *bptree
+	stack []cursorFrame
+	leaf  *node
+	index int
 }
 
 // First moves to the first key/value pair.
@@ -12,38 +13,42 @@ func (c *Cursor) First() ([]byte, []byte) {
 	if c == nil || c.tree == nil {
 		return nil, nil
 	}
-	leaf, err := c.tree.firstLeaf()
+	c.stack = c.stack[:0]
+	leaf, err := c.descendLeft(*c.tree.root)
 	if err != nil || leaf == nil || len(leaf.keys) == 0 {
 		return nil, nil
 	}
-	c.leafID = leaf.pageID
+	c.leaf = leaf
 	c.index = 0
 	return cloneBytes(leaf.keys[0]), cloneBytes(leaf.values[0])
 }
 
 // Next moves to the next key/value pair.
 func (c *Cursor) Next() ([]byte, []byte) {
-	if c == nil || c.tree == nil || c.leafID == 0 {
-		return nil, nil
-	}
-	leaf, err := readNode(c.tree.store, c.leafID)
-	if err != nil {
+	if c == nil || c.tree == nil || c.leaf == nil {
 		return nil, nil
 	}
 	c.index++
-	if c.index < len(leaf.keys) {
-		return cloneBytes(leaf.keys[c.index]), cloneBytes(leaf.values[c.index])
+	if c.index < len(c.leaf.keys) {
+		return cloneBytes(c.leaf.keys[c.index]), cloneBytes(c.leaf.values[c.index])
 	}
-	if leaf.next == 0 {
-		return nil, nil
+
+	for len(c.stack) > 0 {
+		idx := len(c.stack) - 1
+		frame := &c.stack[idx]
+		if frame.index+1 < len(frame.node.children) {
+			frame.index++
+			leaf, err := c.descendLeft(frame.node.children[frame.index])
+			if err != nil || leaf == nil || len(leaf.keys) == 0 {
+				return nil, nil
+			}
+			c.leaf = leaf
+			c.index = 0
+			return cloneBytes(leaf.keys[0]), cloneBytes(leaf.values[0])
+		}
+		c.stack = c.stack[:idx]
 	}
-	leaf, err = readNode(c.tree.store, leaf.next)
-	if err != nil || len(leaf.keys) == 0 {
-		return nil, nil
-	}
-	c.leafID = leaf.pageID
-	c.index = 0
-	return cloneBytes(leaf.keys[0]), cloneBytes(leaf.values[0])
+	return nil, nil
 }
 
 // Seek moves to the first key >= seek.
@@ -51,22 +56,49 @@ func (c *Cursor) Seek(seek []byte) ([]byte, []byte) {
 	if c == nil || c.tree == nil {
 		return nil, nil
 	}
-	leaf, err := c.tree.findLeaf(seek)
-	if err != nil {
+	c.stack = c.stack[:0]
+	leaf, idx, err := c.seekLeaf(*c.tree.root, seek)
+	if err != nil || leaf == nil {
 		return nil, nil
 	}
-	idx, _ := findKeyIndex(leaf.keys, seek)
 	if idx >= len(leaf.keys) {
-		if leaf.next == 0 {
-			return nil, nil
-		}
-		leaf, err = readNode(c.tree.store, leaf.next)
-		if err != nil || len(leaf.keys) == 0 {
-			return nil, nil
-		}
-		idx = 0
+		c.leaf = leaf
+		c.index = len(leaf.keys) - 1
+		return c.Next()
 	}
-	c.leafID = leaf.pageID
+	c.leaf = leaf
 	c.index = idx
 	return cloneBytes(leaf.keys[idx]), cloneBytes(leaf.values[idx])
+}
+
+func (c *Cursor) descendLeft(pageID uint64) (*node, error) {
+	current := pageID
+	for {
+		n, err := readNode(c.tree.store, current)
+		if err != nil {
+			return nil, err
+		}
+		if n.isLeaf {
+			return n, nil
+		}
+		c.stack = append(c.stack, cursorFrame{node: n, index: 0})
+		current = n.children[0]
+	}
+}
+
+func (c *Cursor) seekLeaf(pageID uint64, seek []byte) (*node, int, error) {
+	current := pageID
+	for {
+		n, err := readNode(c.tree.store, current)
+		if err != nil {
+			return nil, 0, err
+		}
+		if n.isLeaf {
+			idx, _ := findKeyIndex(n.keys, seek)
+			return n, idx, nil
+		}
+		idx := findChildIndex(n.keys, seek)
+		c.stack = append(c.stack, cursorFrame{node: n, index: idx})
+		current = n.children[idx]
+	}
 }

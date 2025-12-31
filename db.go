@@ -21,7 +21,10 @@ type DB struct {
 	data     mmap.MMap
 	pageSize int
 	meta     meta
-	mu       sync.RWMutex
+	metaPage uint64
+	mu       sync.Mutex
+	metaMu   sync.RWMutex
+	mapMu    sync.RWMutex
 }
 
 // Open opens or creates a database file.
@@ -38,7 +41,7 @@ func Open(path string) (*DB, error) {
 	}
 
 	if info.Size() == 0 {
-		if err := file.Truncate(int64(defaultPageSize * 2)); err != nil {
+		if err := file.Truncate(int64(defaultPageSize * 3)); err != nil {
 			file.Close()
 			return nil, err
 		}
@@ -53,7 +56,7 @@ func Open(path string) (*DB, error) {
 	db := &DB{file: file, data: data, pageSize: defaultPageSize}
 
 	if info.Size() == 0 {
-		rootID := uint64(1)
+		rootID := uint64(2)
 		leaf := &node{pageID: rootID, isLeaf: true}
 		buf, err := encodeNodePage(db.pageSize, leaf)
 		if err != nil {
@@ -62,8 +65,14 @@ func Open(path string) (*DB, error) {
 		}
 		copy(db.page(rootID), buf)
 
-		db.meta = meta{root: rootID, nextPage: 2}
-		if err := writeMeta(db.page(metaPageID), db.meta, db.pageSize); err != nil {
+		db.meta = meta{txid: 1, root: rootID, nextPage: 3}
+		db.metaPage = metaPage0
+		if err := writeMetaPage(db.page(metaPage0), db.meta, db.pageSize); err != nil {
+			db.Close()
+			return nil, err
+		}
+		empty := meta{txid: 0}
+		if err := writeMetaPage(db.page(metaPage1), empty, db.pageSize); err != nil {
 			db.Close()
 			return nil, err
 		}
@@ -74,12 +83,13 @@ func Open(path string) (*DB, error) {
 		return db, nil
 	}
 
-	meta, err := readMeta(db.page(metaPageID), db.pageSize)
+	meta, metaPage, err := db.readMetaPair()
 	if err != nil {
 		db.Close()
 		return nil, err
 	}
 	db.meta = meta
+	db.metaPage = metaPage
 	return db, nil
 }
 
@@ -91,8 +101,10 @@ func (db *DB) Close() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	if db.data != nil {
+		db.mapMu.Lock()
 		_ = db.data.Flush()
 		_ = db.data.Unmap()
+		db.mapMu.Unlock()
 		db.data = nil
 	}
 	if db.file != nil {
@@ -131,12 +143,14 @@ func (db *DB) Begin(writable bool) *Tx {
 	}
 	if writable {
 		db.mu.Lock()
-		mgr := newTxPageManager(db, true)
+		meta := db.snapshotMeta()
+		mgr := newTxPageManager(db, true, meta)
 		return &Tx{db: db, writable: true, mgr: mgr}
 	}
-	db.mu.RLock()
-	mgr := newTxPageManager(db, false)
-	return &Tx{db: db, mgr: mgr}
+	db.mapMu.RLock()
+	meta := db.snapshotMeta()
+	mgr := newTxPageManager(db, false, meta)
+	return &Tx{db: db, mgr: mgr, mapLock: true}
 }
 
 func (db *DB) page(id uint64) []byte {
@@ -146,6 +160,8 @@ func (db *DB) page(id uint64) []byte {
 }
 
 func (db *DB) remap(size int) error {
+	db.mapMu.Lock()
+	defer db.mapMu.Unlock()
 	if err := db.data.Unmap(); err != nil {
 		return err
 	}
@@ -155,4 +171,39 @@ func (db *DB) remap(size int) error {
 	}
 	db.data = data
 	return nil
+}
+
+func (db *DB) snapshotMeta() meta {
+	db.metaMu.RLock()
+	defer db.metaMu.RUnlock()
+	return meta{
+		txid:     db.meta.txid,
+		root:     db.meta.root,
+		nextPage: db.meta.nextPage,
+		freelist: append([]uint64(nil), db.meta.freelist...),
+	}
+}
+
+func (db *DB) readMetaPair() (meta, uint64, error) {
+	meta0, ok0, err := readMetaPage(db.page(metaPage0), db.pageSize)
+	if err != nil {
+		return meta{}, 0, err
+	}
+	meta1, ok1, err := readMetaPage(db.page(metaPage1), db.pageSize)
+	if err != nil {
+		return meta{}, 0, err
+	}
+	if ok0 && ok1 {
+		if meta1.txid > meta0.txid {
+			return meta1, metaPage1, nil
+		}
+		return meta0, metaPage0, nil
+	}
+	if ok0 {
+		return meta0, metaPage0, nil
+	}
+	if ok1 {
+		return meta1, metaPage1, nil
+	}
+	return meta{}, 0, errors.New("leafdb: no valid meta page")
 }
