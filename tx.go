@@ -314,10 +314,16 @@ func (m *txPageManager) commit() error {
 	if err := m.flushDirty(); err != nil {
 		return err
 	}
+	if err := m.db.msync(); err != nil {
+		return err
+	}
 	if err := m.finalizeMeta(); err != nil {
 		return err
 	}
-	return m.db.data.Flush()
+	if err := m.db.msync(); err != nil {
+		return err
+	}
+	return fdatasync(m.db.file)
 }
 
 func (m *txPageManager) rollback() {

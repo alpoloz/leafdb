@@ -144,6 +144,15 @@ func (db *DB) remap(size int) error {
 	return nil
 }
 
+func (db *DB) msync() error {
+	db.mapMu.RLock()
+	defer db.mapMu.RUnlock()
+	if db.data == nil {
+		return nil
+	}
+	return db.data.Flush()
+}
+
 func (db *DB) snapshotMeta() meta {
 	db.metaMu.RLock()
 	defer db.metaMu.RUnlock()
