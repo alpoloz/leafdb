@@ -11,6 +11,7 @@ type Tx struct {
 	closed   bool
 	mgr      *txPageManager
 	mapLock  bool
+	readTxID uint64
 }
 
 func (tx *Tx) Bucket(name []byte) *Bucket {
@@ -27,31 +28,29 @@ func (tx *Tx) Bucket(name []byte) *Bucket {
 		return nil
 	}
 	pageID := decodePageID(val)
-	kvRoot, bucketRoot, err := readBucketHeader(tx.mgr, pageID)
+	kvRoot, bucketRoot, sequence, err := readBucketHeader(tx.mgr, pageID)
 	if err != nil {
 		return nil
 	}
-	return &Bucket{tx: tx, name: cloneBytes(name), header: pageID, kvRoot: kvRoot, bucketRoot: bucketRoot}
+	return &Bucket{
+		tx:         tx,
+		name:       cloneBytes(name),
+		header:     pageID,
+		kvRoot:     kvRoot,
+		bucketRoot: bucketRoot,
+		sequence:   sequence,
+	}
 }
 
 func (tx *Tx) CreateBucket(name []byte) (*Bucket, error) {
-	if tx == nil || tx.closed {
-		return nil, ErrTxClosed
-	}
-	if !tx.writable {
-		return nil, ErrTxReadOnly
-	}
-	if len(name) == 0 {
-		return nil, errors.New("leafdb: bucket name required")
+	if err := tx.validateWritable(name); err != nil {
+		return nil, err
 	}
 	root := tx.mgr.root
 	tree := newBPTree(&root, tx.mgr)
-	if _, ok, err := tree.get(name); err != nil {
+	if err := ensureBucketMissing(tree, name); err != nil {
 		return nil, err
-	} else if ok {
-		return nil, ErrBucketExists
 	}
-
 	bucket, err := tx.createBucket()
 	if err != nil {
 		return nil, err
@@ -133,6 +132,9 @@ func (tx *Tx) close() {
 	if tx.writable {
 		tx.db.mu.Unlock()
 	} else if tx.mapLock {
+		if tx.readTxID != 0 {
+			tx.db.removeReadTx(tx.readTxID)
+		}
 		tx.db.mapMu.RUnlock()
 	}
 }
@@ -160,14 +162,14 @@ func (tx *Tx) createBucket() (*Bucket, error) {
 		return nil, err
 	}
 
-	if err := writeBucketHeader(tx.mgr, headerID, kvRootID, bucketRootID); err != nil {
+	if err := writeBucketHeader(tx.mgr, headerID, kvRootID, bucketRootID, 0); err != nil {
 		return nil, err
 	}
-	return &Bucket{tx: tx, header: headerID, kvRoot: kvRootID, bucketRoot: bucketRootID}, nil
+	return &Bucket{tx: tx, header: headerID, kvRoot: kvRootID, bucketRoot: bucketRootID, sequence: 0}, nil
 }
 
 func (tx *Tx) releaseBucket(headerID uint64) {
-	kvRoot, bucketRoot, err := readBucketHeader(tx.mgr, headerID)
+	kvRoot, bucketRoot, _, err := readBucketHeader(tx.mgr, headerID)
 	if err != nil {
 		return
 	}
@@ -205,6 +207,28 @@ func decodePageID(b []byte) uint64 {
 	return binary.LittleEndian.Uint64(b)
 }
 
+func (tx *Tx) validateWritable(name []byte) error {
+	if tx == nil || tx.closed {
+		return ErrTxClosed
+	}
+	if !tx.writable {
+		return ErrTxReadOnly
+	}
+	if len(name) == 0 {
+		return errors.New("leafdb: bucket name required")
+	}
+	return nil
+}
+
+func ensureBucketMissing(tree *bptree, name []byte) error {
+	if _, ok, err := tree.get(name); err != nil {
+		return err
+	} else if ok {
+		return ErrBucketExists
+	}
+	return nil
+}
+
 // txPageManager provides per-transaction page access.
 type txPageManager struct {
 	db       *DB
@@ -214,6 +238,7 @@ type txPageManager struct {
 	txid     uint64
 	nextPage uint64
 	freelist []uint64
+	pending  []uint64
 	dirty    map[uint64][]byte
 	maxPage  uint64
 }
@@ -279,39 +304,91 @@ func (m *txPageManager) FreePage(id uint64) {
 	if id == metaPage0 || id == metaPage1 {
 		return
 	}
-	m.freelist = append(m.freelist, id)
+	m.pending = append(m.pending, id)
 }
 
 func (m *txPageManager) commit() error {
-	requiredSize := int((m.maxPage + 1) * uint64(m.pageSize))
-	if requiredSize > len(m.db.data) {
-		if err := m.db.file.Truncate(int64(requiredSize)); err != nil {
-			return err
-		}
-		if err := m.db.remap(requiredSize); err != nil {
-			return err
-		}
-	}
-
-	for id, buf := range m.dirty {
-		copy(m.db.page(id), buf)
-	}
-
-	newMeta := meta{txid: m.txid + 1, root: m.root, nextPage: m.nextPage, freelist: m.freelist}
-	var nextMetaPage uint64 = metaPage0
-	if m.db.metaPage == metaPage0 {
-		nextMetaPage = metaPage1
-	}
-	if err := writeMetaPage(m.db.page(nextMetaPage), newMeta, m.pageSize); err != nil {
+	if err := m.ensureMapSize(); err != nil {
 		return err
 	}
-	m.db.metaMu.Lock()
-	m.db.meta = newMeta
-	m.db.metaPage = nextMetaPage
-	m.db.metaMu.Unlock()
+	if err := m.flushDirty(); err != nil {
+		return err
+	}
+	if err := m.finalizeMeta(); err != nil {
+		return err
+	}
 	return m.db.data.Flush()
 }
 
 func (m *txPageManager) rollback() {
 	m.dirty = nil
+}
+
+func (m *txPageManager) ensureMapSize() error {
+	requiredSize := int((m.maxPage + 1) * uint64(m.pageSize))
+	if requiredSize <= len(m.db.data) {
+		return nil
+	}
+	if err := m.db.file.Truncate(int64(requiredSize)); err != nil {
+		return err
+	}
+	return m.db.remap(requiredSize)
+}
+
+func (m *txPageManager) flushDirty() error {
+	for id, buf := range m.dirty {
+		copy(m.db.page(id), buf)
+	}
+	return nil
+}
+
+func (m *txPageManager) finalizeMeta() error {
+	newMeta := meta{txid: m.txid + 1, root: m.root, nextPage: m.nextPage, freelist: nil}
+	nextMetaPage := m.nextMetaPage()
+	minRead, threshold := m.reuseThreshold(newMeta.txid)
+	reusable, remaining := m.collectReusable(newMeta.txid, minRead, threshold)
+	newMeta.freelist = append(m.freelist, reusable...)
+
+	m.db.metaMu.Lock()
+	defer m.db.metaMu.Unlock()
+	if err := writeMetaPage(m.db.page(nextMetaPage), newMeta, m.pageSize); err != nil {
+		return err
+	}
+	m.db.pending = remaining
+	m.db.meta = newMeta
+	m.db.metaPage = nextMetaPage
+	return nil
+}
+
+func (m *txPageManager) nextMetaPage() uint64 {
+	if m.db.metaPage == metaPage0 {
+		return metaPage1
+	}
+	return metaPage0
+}
+
+func (m *txPageManager) reuseThreshold(txid uint64) (uint64, uint64) {
+	minRead, ok := m.db.minReadTxID()
+	if ok {
+		return minRead, minRead
+	}
+	return 0, txid + 1
+}
+
+func (m *txPageManager) collectReusable(txid uint64, minRead uint64, threshold uint64) ([]uint64, []pendingFree) {
+	pending := make([]pendingFree, 0, len(m.db.pending)+len(m.pending))
+	pending = append(pending, m.db.pending...)
+	for _, id := range m.pending {
+		pending = append(pending, pendingFree{txid: txid, id: id})
+	}
+	reusable := make([]uint64, 0, len(pending))
+	remaining := make([]pendingFree, 0, len(pending))
+	for _, entry := range pending {
+		if entry.txid < threshold && (minRead == 0 || entry.txid < minRead) {
+			reusable = append(reusable, entry.id)
+		} else {
+			remaining = append(remaining, entry)
+		}
+	}
+	return reusable, remaining
 }

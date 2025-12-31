@@ -27,17 +27,15 @@ func readMetaPage(page []byte, pageSize int) (meta, bool, error) {
 	if len(page) < pageSize {
 		return meta{}, false, errors.New("leafdb: invalid meta page")
 	}
-	if string(page[:4]) != fileMagic {
-		return meta{}, false, nil
+	valid, err := readMetaHeader(page, pageSize)
+	if err != nil || !valid {
+		return meta{}, false, err
 	}
-	ps := int(binary.LittleEndian.Uint32(page[4:]))
-	if ps != pageSize {
-		return meta{}, false, errors.New("leafdb: page size mismatch")
+	m := meta{
+		txid:     binary.LittleEndian.Uint64(page[8:]),
+		root:     binary.LittleEndian.Uint64(page[16:]),
+		nextPage: binary.LittleEndian.Uint64(page[24:]),
 	}
-	m := meta{}
-	m.txid = binary.LittleEndian.Uint64(page[8:])
-	m.root = binary.LittleEndian.Uint64(page[16:])
-	m.nextPage = binary.LittleEndian.Uint64(page[24:])
 	freeCount := int(binary.LittleEndian.Uint32(page[32:]))
 	maxFree := (pageSize - 36) / 8
 	if freeCount > maxFree {
@@ -71,4 +69,15 @@ func writeMetaPage(page []byte, m meta, pageSize int) error {
 		off += 8
 	}
 	return nil
+}
+
+func readMetaHeader(page []byte, pageSize int) (bool, error) {
+	if string(page[:4]) != fileMagic {
+		return false, nil
+	}
+	ps := int(binary.LittleEndian.Uint32(page[4:]))
+	if ps != pageSize {
+		return false, errors.New("leafdb: page size mismatch")
+	}
+	return true, nil
 }

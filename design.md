@@ -23,7 +23,7 @@ file_offset = page_id * page_size
 
 ```
 | Page 0 | Page 1 | Page 2 | Page 3 | ... |
-| Meta0  | Meta1  | Root   | Data   | ... |
+| Meta0  | Meta1  | Data   | Data   | ... |
 
 Meta pages (page 0 and page 1):
   - magic, page size, txid
@@ -31,8 +31,8 @@ Meta pages (page 0 and page 1):
   - next page id
   - freelist
 
-Root page (page 2):
-  - B+ tree node (leaf/branch) for top-level buckets
+Root page:
+  - Stored in meta, points to a B+ tree node (leaf/branch) for top-level buckets
   - keys = bucket names, values = bucket header page ids
 ```
 
@@ -62,6 +62,7 @@ Offset  Size  Field
 0       1     Page type = 3 (bucket header)
 1       8     KV tree root page ID (uint64)
 9       8     Bucket index root page ID (uint64)
+17      8     Bucket sequence (uint64)
 ```
 
 ### B+ Tree Pages
@@ -104,6 +105,9 @@ Child[0..N] (uint64 each), then Key[0..N-1] (uint16 + bytes)
   and then flipping the meta page (meta0/meta1).
 - Read transactions pin the mmap during the transaction and use the meta
   snapshot chosen at Begin time.
+- Freed pages are reusable only when no active reader can see them; pending
+  frees are promoted to the freelist when their TxID is older than the oldest
+  active reader.
 
 ## Implementation Decisions
 
@@ -113,22 +117,7 @@ Child[0..N] (uint64 each), then Key[0..N-1] (uint16 + bytes)
   existing pages, enabling snapshot reads.
 - **Separate trees per bucket**: Nested buckets are stored in a dedicated
   bucket-index tree rather than mixing bucket and KV keys.
-- **Freelist in meta page**: Simplifies allocation, but currently unused for
-  reuse to preserve MVCC safety.
+- **Freelist in meta page**: Reused only when safe under MVCC by tracking
+  active reader TxIDs and pending frees.
 - **Cursor iteration**: Implemented by walking branch paths to avoid reliance
   on mutable leaf links.
-
-## Alternatives and Tradeoffs
-
-- **Copy-on-write (CoW) pages**: Selected for snapshot isolation. Requires
-  background or epoch-based GC to safely reuse pages.
-- **Write-ahead log (WAL)**: Adds durability guarantees and crash recovery at
-  the cost of more I/O and log compaction logic.
-- **Append-only B+ tree**: Simplifies writes and recovery but increases file
-  size without compaction.
-- **Separate files per bucket**: Simplifies bucket isolation but complicates
-  transactions and increases file management overhead.
-- **Freelist as a tree**: Removes meta page size limits but adds complexity to
-  page allocation.
-- **In-memory caching layer**: Improves hot reads but increases complexity and
-  memory usage.

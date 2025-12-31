@@ -131,33 +131,7 @@ func (t *bptree) insert(pageID uint64, key, value []byte) (uint64, []byte, uint6
 		return 0, nil, 0, false, err
 	}
 	if n.isLeaf {
-		newNode := cloneNode(n)
-		newNode.pageID = t.store.AllocPage()
-		idx, exists := findKeyIndex(newNode.keys, key)
-		if exists {
-			newNode.values[idx] = cloneBytes(value)
-			buf, err := encodeNodePage(t.store.PageSize(), newNode)
-			if err != nil {
-				return 0, nil, 0, false, err
-			}
-			if err := t.store.WritePage(newNode.pageID, buf); err != nil {
-				return 0, nil, 0, false, err
-			}
-			return newNode.pageID, nil, 0, false, nil
-		}
-		insertAt(&newNode.keys, idx, cloneBytes(key))
-		insertAt(&newNode.values, idx, cloneBytes(value))
-		if nodeFits(t.store.PageSize(), newNode) {
-			buf, err := encodeNodePage(t.store.PageSize(), newNode)
-			if err != nil {
-				return 0, nil, 0, false, err
-			}
-			if err := t.store.WritePage(newNode.pageID, buf); err != nil {
-				return 0, nil, 0, false, err
-			}
-			return newNode.pageID, nil, 0, false, nil
-		}
-		return t.splitLeaf(newNode)
+		return t.insertLeaf(n, key, value)
 	}
 
 	idx := findChildIndex(n.keys, key)
@@ -166,24 +140,7 @@ func (t *bptree) insert(pageID uint64, key, value []byte) (uint64, []byte, uint6
 	if err != nil {
 		return 0, nil, 0, false, err
 	}
-	newNode := cloneNode(n)
-	newNode.pageID = t.store.AllocPage()
-	newNode.children[idx] = newChildID
-	if split {
-		insertAt(&newNode.keys, idx, promoted)
-		insertAtUint64(&newNode.children, idx+1, rightID)
-	}
-	if nodeFits(t.store.PageSize(), newNode) {
-		buf, err := encodeNodePage(t.store.PageSize(), newNode)
-		if err != nil {
-			return 0, nil, 0, false, err
-		}
-		if err := t.store.WritePage(newNode.pageID, buf); err != nil {
-			return 0, nil, 0, false, err
-		}
-		return newNode.pageID, nil, 0, false, nil
-	}
-	return t.splitBranch(newNode)
+	return t.insertBranch(n, idx, newChildID, promoted, rightID, split)
 }
 
 func (t *bptree) splitLeaf(n *node) (uint64, []byte, uint64, bool, error) {
@@ -257,22 +214,7 @@ func (t *bptree) deleteRecursive(pageID uint64, key []byte) (uint64, bool, error
 		return 0, false, err
 	}
 	if n.isLeaf {
-		idx, ok := findKeyIndex(n.keys, key)
-		if !ok {
-			return pageID, false, nil
-		}
-		newNode := cloneNode(n)
-		newNode.pageID = t.store.AllocPage()
-		removeAt(&newNode.keys, idx)
-		removeAt(&newNode.values, idx)
-		buf, err := encodeNodePage(t.store.PageSize(), newNode)
-		if err != nil {
-			return 0, false, err
-		}
-		if err := t.store.WritePage(newNode.pageID, buf); err != nil {
-			return 0, false, err
-		}
-		return newNode.pageID, true, nil
+		return t.deleteLeaf(n, key)
 	}
 
 	idx := findChildIndex(n.keys, key)
@@ -284,18 +226,7 @@ func (t *bptree) deleteRecursive(pageID uint64, key []byte) (uint64, bool, error
 	if !deleted {
 		return pageID, false, nil
 	}
-
-	newNode := cloneNode(n)
-	newNode.pageID = t.store.AllocPage()
-	newNode.children[idx] = newChildID
-	buf, err := encodeNodePage(t.store.PageSize(), newNode)
-	if err != nil {
-		return 0, false, err
-	}
-	if err := t.store.WritePage(newNode.pageID, buf); err != nil {
-		return 0, false, err
-	}
-	return newNode.pageID, true, nil
+	return t.deleteBranch(n, idx, newChildID)
 }
 
 func readNode(store pageStore, pageID uint64) (*node, error) {
@@ -313,45 +244,9 @@ func readNode(store pageStore, pageID uint64) (*node, error) {
 
 	switch kind {
 	case pageLeaf:
-		n := &node{pageID: pageID, isLeaf: true, next: next}
-		n.keys = make([][]byte, keyCount)
-		n.values = make([][]byte, keyCount)
-		for i := 0; i < keyCount; i++ {
-			var key []byte
-			key, pos, err = readKey(buf, pos)
-			if err != nil {
-				return nil, err
-			}
-			n.keys[i] = key
-			var val []byte
-			val, pos, err = readValue(buf, pos)
-			if err != nil {
-				return nil, err
-			}
-			n.values[i] = val
-		}
-		return n, nil
+		return decodeLeafNode(pageID, next, keyCount, buf, pos)
 	case pageBranch:
-		n := &node{pageID: pageID, isLeaf: false}
-		childCount := keyCount + 1
-		n.children = make([]uint64, childCount)
-		for i := 0; i < childCount; i++ {
-			if pos+8 > len(buf) {
-				return nil, errors.New("leafdb: invalid branch page")
-			}
-			n.children[i] = binary.LittleEndian.Uint64(buf[pos:])
-			pos += 8
-		}
-		n.keys = make([][]byte, keyCount)
-		for i := 0; i < keyCount; i++ {
-			var key []byte
-			key, pos, err = readKey(buf, pos)
-			if err != nil {
-				return nil, err
-			}
-			n.keys[i] = key
-		}
-		return n, nil
+		return decodeBranchNode(pageID, keyCount, buf, pos)
 	default:
 		return nil, errors.New("leafdb: invalid node page")
 	}
@@ -361,39 +256,10 @@ func encodeNodePage(pageSize int, n *node) ([]byte, error) {
 	buf := make([]byte, pageSize)
 	if n.isLeaf {
 		buf[0] = pageLeaf
-	} else {
-		buf[0] = pageBranch
+		return encodeLeafPage(buf, n)
 	}
-	binary.LittleEndian.PutUint16(buf[1:], uint16(len(n.keys)))
-	binary.LittleEndian.PutUint64(buf[3:], n.next)
-	pos := nodeHeaderSize
-
-	if n.isLeaf {
-		for i, key := range n.keys {
-			var err error
-			pos, err = writeKeyValue(buf, pos, key, n.values[i])
-			if err != nil {
-				return nil, err
-			}
-		}
-		return buf, nil
-	}
-
-	for _, child := range n.children {
-		if pos+8 > len(buf) {
-			return nil, errors.New("leafdb: node too large for page")
-		}
-		binary.LittleEndian.PutUint64(buf[pos:], child)
-		pos += 8
-	}
-	for _, key := range n.keys {
-		var err error
-		pos, err = writeKey(buf, pos, key)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return buf, nil
+	buf[0] = pageBranch
+	return encodeBranchPage(buf, n)
 }
 
 func nodeFits(pageSize int, n *node) bool {
@@ -536,4 +402,136 @@ func cloneNode(n *node) *node {
 	}
 	out.children = append(out.children, n.children...)
 	return out
+}
+
+func (t *bptree) insertLeaf(n *node, key, value []byte) (uint64, []byte, uint64, bool, error) {
+	newNode := cloneNode(n)
+	newNode.pageID = t.store.AllocPage()
+	idx, exists := findKeyIndex(newNode.keys, key)
+	if exists {
+		newNode.values[idx] = cloneBytes(value)
+		return newNode.pageID, nil, 0, false, t.writeNode(newNode)
+	}
+	insertAt(&newNode.keys, idx, cloneBytes(key))
+	insertAt(&newNode.values, idx, cloneBytes(value))
+	if nodeFits(t.store.PageSize(), newNode) {
+		return newNode.pageID, nil, 0, false, t.writeNode(newNode)
+	}
+	return t.splitLeaf(newNode)
+}
+
+func (t *bptree) insertBranch(n *node, idx int, newChildID uint64, promoted []byte, rightID uint64, split bool) (uint64, []byte, uint64, bool, error) {
+	newNode := cloneNode(n)
+	newNode.pageID = t.store.AllocPage()
+	newNode.children[idx] = newChildID
+	if split {
+		insertAt(&newNode.keys, idx, promoted)
+		insertAtUint64(&newNode.children, idx+1, rightID)
+	}
+	if nodeFits(t.store.PageSize(), newNode) {
+		return newNode.pageID, nil, 0, false, t.writeNode(newNode)
+	}
+	return t.splitBranch(newNode)
+}
+
+func (t *bptree) deleteLeaf(n *node, key []byte) (uint64, bool, error) {
+	idx, ok := findKeyIndex(n.keys, key)
+	if !ok {
+		return n.pageID, false, nil
+	}
+	newNode := cloneNode(n)
+	newNode.pageID = t.store.AllocPage()
+	removeAt(&newNode.keys, idx)
+	removeAt(&newNode.values, idx)
+	return newNode.pageID, true, t.writeNode(newNode)
+}
+
+func (t *bptree) deleteBranch(n *node, idx int, newChildID uint64) (uint64, bool, error) {
+	newNode := cloneNode(n)
+	newNode.pageID = t.store.AllocPage()
+	newNode.children[idx] = newChildID
+	return newNode.pageID, true, t.writeNode(newNode)
+}
+
+func (t *bptree) writeNode(n *node) error {
+	buf, err := encodeNodePage(t.store.PageSize(), n)
+	if err != nil {
+		return err
+	}
+	return t.store.WritePage(n.pageID, buf)
+}
+
+func decodeLeafNode(pageID uint64, next uint64, keyCount int, buf []byte, pos int) (*node, error) {
+	n := &node{pageID: pageID, isLeaf: true, next: next}
+	n.keys = make([][]byte, keyCount)
+	n.values = make([][]byte, keyCount)
+	for i := 0; i < keyCount; i++ {
+		var err error
+		n.keys[i], pos, err = readKey(buf, pos)
+		if err != nil {
+			return nil, err
+		}
+		n.values[i], pos, err = readValue(buf, pos)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return n, nil
+}
+
+func decodeBranchNode(pageID uint64, keyCount int, buf []byte, pos int) (*node, error) {
+	n := &node{pageID: pageID, isLeaf: false}
+	childCount := keyCount + 1
+	n.children = make([]uint64, childCount)
+	for i := 0; i < childCount; i++ {
+		if pos+8 > len(buf) {
+			return nil, errors.New("leafdb: invalid branch page")
+		}
+		n.children[i] = binary.LittleEndian.Uint64(buf[pos:])
+		pos += 8
+	}
+	n.keys = make([][]byte, keyCount)
+	for i := 0; i < keyCount; i++ {
+		var err error
+		n.keys[i], pos, err = readKey(buf, pos)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return n, nil
+}
+
+func encodeLeafPage(buf []byte, n *node) ([]byte, error) {
+	binary.LittleEndian.PutUint16(buf[1:], uint16(len(n.keys)))
+	binary.LittleEndian.PutUint64(buf[3:], n.next)
+	pos := nodeHeaderSize
+	for i, key := range n.keys {
+		var err error
+		pos, err = writeKeyValue(buf, pos, key, n.values[i])
+		if err != nil {
+			return nil, err
+		}
+	}
+	return buf, nil
+}
+
+func encodeBranchPage(buf []byte, n *node) ([]byte, error) {
+	binary.LittleEndian.PutUint16(buf[1:], uint16(len(n.keys)))
+	binary.LittleEndian.PutUint64(buf[3:], 0)
+	pos := nodeHeaderSize
+	for _, child := range n.children {
+		if pos+8 > len(buf) {
+			return nil, errors.New("leafdb: node too large for page")
+		}
+		binary.LittleEndian.PutUint64(buf[pos:], child)
+		pos += 8
+	}
+	for _, key := range n.keys {
+		var err error
+		pos, err = writeKey(buf, pos, key)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return buf, nil
 }
