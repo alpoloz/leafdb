@@ -1,12 +1,13 @@
 # leafdb
-Leafdb is a small Go key/value store backed by a B+ tree with page-based
-persistence and a tiny API: get, set,
-delete, and optional buffered flushes.
+Leafdb is a small Go key/value store backed by a B+ tree stored on disk via
+memory-mapped pages. It uses Bolt-style buckets, nested buckets, and
+single-writer/multi-reader transactions.
 
 ## Features
-- In-memory B+ tree with fixed-size page persistence
-- Point reads and inserts
-- Buffered writes with configurable flush intervals
+- Memory-mapped, page-based B+ tree storage
+- Buckets with nested buckets for namespacing
+- Single-writer, multiple-reader transactions
+- Cursor iteration over bucket key/value pairs
 - Simple example app
 
 ## Usage
@@ -22,52 +23,92 @@ import (
 )
 
 func main() {
-	db, err := leafdb.OpenWithOptions("example.db", &leafdb.Options{FlushEvery: 2})
+	db, err := leafdb.Open("example.db")
 	if err != nil {
 		log.Fatalf("open failed: %v", err)
 	}
 	defer db.Close()
 
-	if err := db.Set([]byte("name"), []byte("leaf")); err != nil {
-		log.Fatalf("set failed: %v", err)
+	if err := db.Update(func(tx *leafdb.Tx) error {
+		bucket, err := tx.CreateBucketIfNotExists([]byte("config"))
+		if err != nil {
+			return err
+		}
+		if err := bucket.Put([]byte("name"), []byte("leaf")); err != nil {
+			return err
+		}
+		return bucket.Put([]byte("version"), []byte("1"))
+	}); err != nil {
+		log.Fatalf("update failed: %v", err)
 	}
 
-	val, ok := db.Get([]byte("name"))
-	if !ok {
-		log.Fatalf("missing key")
+	if err := db.View(func(tx *leafdb.Tx) error {
+		bucket := tx.Bucket([]byte("config"))
+		if bucket == nil {
+			return fmt.Errorf("missing bucket")
+		}
+		val := bucket.Get([]byte("name"))
+		fmt.Printf("name=%s\n", val)
+		return nil
+	}); err != nil {
+		log.Fatalf("view failed: %v", err)
 	}
-	fmt.Printf("name=%s\n", val)
 
-	if _, err := db.Delete([]byte("name")); err != nil {
-		log.Fatalf("delete failed: %v", err)
-	}
 }
 ```
 
-## Transactions
+## Transactions and Buckets
 
 ```go
-err := db.View(func(tx *leafdb.Tx) error {
-	val, ok := tx.Get([]byte("name"))
-	if !ok {
-		return nil
+err := db.Update(func(tx *leafdb.Tx) error {
+	parent, err := tx.CreateBucketIfNotExists([]byte("parent"))
+	if err != nil {
+		return err
 	}
-	fmt.Printf("name=%s\n", val)
+	child, err := parent.CreateBucketIfNotExists([]byte("child"))
+	if err != nil {
+		return err
+	}
+	return child.Put([]byte("k"), []byte("v"))
+})
+if err != nil {
+	log.Fatalf("update failed: %v", err)
+}
+
+err = db.View(func(tx *leafdb.Tx) error {
+	parent := tx.Bucket([]byte("parent"))
+	if parent == nil {
+		return fmt.Errorf("missing parent")
+	}
+	child := parent.Bucket([]byte("child"))
+	if child == nil {
+		return fmt.Errorf("missing child")
+	}
+	val := child.Get([]byte("k"))
+	fmt.Printf("k=%s\n", val)
 	return nil
 })
 if err != nil {
 	log.Fatalf("view failed: %v", err)
 }
+```
 
-err = db.Update(func(tx *leafdb.Tx) error {
-	if err := tx.Set([]byte("name"), []byte("leaf")); err != nil {
-		return err
+## Cursor
+
+```go
+err := db.View(func(tx *leafdb.Tx) error {
+	bucket := tx.Bucket([]byte("config"))
+	if bucket == nil {
+		return fmt.Errorf("missing bucket")
 	}
-	_, err := tx.Delete([]byte("old"))
-	return err
+	cursor := bucket.Cursor()
+	for k, v := cursor.First(); k != nil; k, v = cursor.Next() {
+		fmt.Printf("%s=%s\n", k, v)
+	}
+	return nil
 })
 if err != nil {
-	log.Fatalf("update failed: %v", err)
+	log.Fatalf("cursor failed: %v", err)
 }
 ```
 
@@ -80,4 +121,4 @@ go run ./cmd/db
 
 ## Notes
 - The on-disk format is not stable yet and may change.
-- Deletions currently free empty leaf pages but do not rebalance the tree.
+- Writes are committed via mmap page updates in a single writer transaction.

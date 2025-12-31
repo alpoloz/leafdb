@@ -2,44 +2,31 @@ package leafdb
 
 import "testing"
 
-func TestSetGet(t *testing.T) {
-	db := New()
-	key := []byte("alpha")
-	val := []byte("one")
+func TestBucketPutGet(t *testing.T) {
+	db := newTestDB(t)
+	defer db.Close()
 
-	if err := db.Set(key, val); err != nil {
-		t.Fatalf("set failed: %v", err)
-	}
-	got, ok := db.Get(key)
-	if !ok {
-		t.Fatalf("expected key to exist")
-	}
-	if string(got) != "one" {
-		t.Fatalf("unexpected value: %s", got)
-	}
-
-	if err := db.Set(key, []byte("two")); err != nil {
-		t.Fatalf("set failed: %v", err)
-	}
-	got, ok = db.Get(key)
-	if !ok || string(got) != "two" {
-		t.Fatalf("expected updated value, got %q", got)
-	}
-}
-
-func TestSplit(t *testing.T) {
-	db := &DB{index: newBPTree(4, nil)}
-	for i := 0; i < 20; i++ {
-		key := []byte{byte('a' + i)}
-		if err := db.Set(key, []byte{byte('A' + i)}); err != nil {
-			t.Fatalf("set failed: %v", err)
+	if err := db.Update(func(tx *Tx) error {
+		bucket, err := tx.CreateBucketIfNotExists([]byte("config"))
+		if err != nil {
+			return err
 		}
+		return bucket.Put([]byte("key"), []byte("value"))
+	}); err != nil {
+		t.Fatalf("update failed: %v", err)
 	}
-	for i := 0; i < 20; i++ {
-		key := []byte{byte('a' + i)}
-		got, ok := db.Get(key)
-		if !ok || len(got) != 1 || got[0] != byte('A'+i) {
-			t.Fatalf("missing or wrong value for %q", key)
+
+	if err := db.View(func(tx *Tx) error {
+		bucket := tx.Bucket([]byte("config"))
+		if bucket == nil {
+			t.Fatalf("expected bucket")
 		}
+		val := bucket.Get([]byte("key"))
+		if string(val) != "value" {
+			t.Fatalf("unexpected value: %s", val)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("view failed: %v", err)
 	}
 }

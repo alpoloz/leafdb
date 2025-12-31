@@ -1,239 +1,104 @@
 package leafdb
 
 import (
-	"bytes"
 	"errors"
 	"os"
 	"sync"
+
+	"github.com/edsrzf/mmap-go"
 )
 
-// DB is a simple key/value store backed by a B+ tree.
+var (
+	ErrTxClosed       = errors.New("leafdb: transaction closed")
+	ErrTxReadOnly     = errors.New("leafdb: read-only transaction")
+	ErrBucketExists   = errors.New("leafdb: bucket exists")
+	ErrBucketNotFound = errors.New("leafdb: bucket not found")
+)
+
+// DB is a memory-mapped key/value store with B+ tree pages on disk.
 type DB struct {
-	index      *bptree
-	file       *os.File
-	pager      *pager
-	flushEvery int
-	pending    int
-	dirty      bool
-	mu         sync.RWMutex
+	file     *os.File
+	data     mmap.MMap
+	pageSize int
+	meta     meta
+	mu       sync.RWMutex
 }
 
-// Options controls persistence behavior.
-type Options struct {
-	// FlushEvery controls how many Set calls are buffered before persisting.
-	// Values less than 1 are treated as 1 (flush every Set).
-	FlushEvery int
-}
-
-// New creates an empty database with a reasonable default order.
-func New() *DB {
-	return newDB(defaultOrder, nil)
-}
-
-// Open creates or opens a database file and loads its contents.
+// Open opens or creates a database file.
 func Open(path string) (*DB, error) {
-	return OpenWithOptions(path, nil)
-}
-
-// OpenWithOptions creates or opens a database file with persistence options.
-func OpenWithOptions(path string, opts *Options) (*DB, error) {
-	file, err := openFile(path)
+	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o644)
 	if err != nil {
 		return nil, err
 	}
 
-	db := newDB(defaultOrder, opts)
-	db.file = file
-	if err := db.loadFromFile(); err != nil {
+	info, err := file.Stat()
+	if err != nil {
 		file.Close()
 		return nil, err
 	}
+
+	if info.Size() == 0 {
+		if err := file.Truncate(int64(defaultPageSize * 2)); err != nil {
+			file.Close()
+			return nil, err
+		}
+	}
+
+	data, err := mmap.MapRegion(file, -1, mmap.RDWR, 0, 0)
+	if err != nil {
+		file.Close()
+		return nil, err
+	}
+
+	db := &DB{file: file, data: data, pageSize: defaultPageSize}
+
+	if info.Size() == 0 {
+		rootID := uint64(1)
+		leaf := &node{pageID: rootID, isLeaf: true}
+		buf, err := encodeNodePage(db.pageSize, leaf)
+		if err != nil {
+			db.Close()
+			return nil, err
+		}
+		copy(db.page(rootID), buf)
+
+		db.meta = meta{root: rootID, nextPage: 2}
+		if err := writeMeta(db.page(metaPageID), db.meta, db.pageSize); err != nil {
+			db.Close()
+			return nil, err
+		}
+		if err := db.data.Flush(); err != nil {
+			db.Close()
+			return nil, err
+		}
+		return db, nil
+	}
+
+	meta, err := readMeta(db.page(metaPageID), db.pageSize)
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	db.meta = meta
 	return db, nil
 }
 
-// Close closes the underlying file, if any.
+// Close flushes and closes the database.
 func (db *DB) Close() error {
-	if db == nil || db.file == nil {
-		return nil
-	}
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	if err := db.flushLocked(); err != nil {
-		return err
-	}
-	return db.file.Close()
-}
-
-// Set inserts or replaces the value for key.
-func (db *DB) Set(key, value []byte) error {
 	if db == nil {
 		return nil
 	}
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	op := batchOp{key: cloneBytes(key), value: cloneBytes(value)}
-	return db.applyOpsLocked([]batchOp{op})
-}
-
-// Delete removes a key if it exists. It returns true when a key was deleted.
-func (db *DB) Delete(key []byte) (bool, error) {
-	if db == nil {
-		return false, nil
+	if db.data != nil {
+		_ = db.data.Flush()
+		_ = db.data.Unmap()
+		db.data = nil
 	}
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	_, removed := db.index.get(key)
-	if !removed {
-		return false, nil
+	if db.file != nil {
+		return db.file.Close()
 	}
-	op := batchOp{key: cloneBytes(key), del: true}
-	return true, db.applyOpsLocked([]batchOp{op})
-}
-
-// Get returns the value for key. The returned value is a copy.
-func (db *DB) Get(key []byte) ([]byte, bool) {
-	if db == nil {
-		return nil, false
-	}
-	db.mu.RLock()
-	defer db.mu.RUnlock()
-	val, ok := db.index.get(key)
-	if !ok {
-		return nil, false
-	}
-	return cloneBytes(val), true
-}
-
-// Flush writes buffered changes to disk, if any.
-func (db *DB) Flush() error {
-	if db == nil || db.file == nil || !db.dirty {
-		return nil
-	}
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	return db.flushLocked()
-}
-
-func newDB(order int, opts *Options) *DB {
-	flushEvery := 1
-	if opts != nil && opts.FlushEvery > 0 {
-		flushEvery = opts.FlushEvery
-	}
-	return &DB{
-		index:      newBPTree(order, nil),
-		flushEvery: flushEvery,
-	}
-}
-
-func (db *DB) flushLocked() error {
-	if db == nil || db.file == nil || !db.dirty {
-		return nil
-	}
-	if err := db.saveToFile(); err != nil {
-		return err
-	}
-	db.pending = 0
-	db.dirty = false
 	return nil
-}
-
-func (db *DB) applyOpsLocked(ops []batchOp) error {
-	for _, op := range ops {
-		if op.del {
-			db.index.delete(op.key)
-			continue
-		}
-		db.index.insert(op.key, op.value)
-	}
-
-	if db.file == nil {
-		return nil
-	}
-	db.dirty = true
-	db.pending++
-	if db.pending < db.flushEvery {
-		return nil
-	}
-	if err := db.saveToFile(); err != nil {
-		return err
-	}
-	db.pending = 0
-	db.dirty = false
-	return nil
-}
-
-// Batch groups multiple updates to be applied atomically.
-type Batch struct {
-	ops []batchOp
-}
-
-type batchOp struct {
-	key   []byte
-	value []byte
-	del   bool
-}
-
-// NewBatch creates an empty batch.
-func NewBatch() *Batch {
-	return &Batch{}
-}
-
-// Set buffers a key/value upsert in the batch.
-func (b *Batch) Set(key, value []byte) {
-	if b == nil {
-		return
-	}
-	b.ops = append(b.ops, batchOp{key: cloneBytes(key), value: cloneBytes(value)})
-}
-
-// Delete buffers a deletion in the batch.
-func (b *Batch) Delete(key []byte) {
-	if b == nil {
-		return
-	}
-	b.ops = append(b.ops, batchOp{key: cloneBytes(key), del: true})
-}
-
-// Apply executes the batch atomically and persists once when needed.
-func (db *DB) Apply(b *Batch) error {
-	if db == nil || b == nil || len(b.ops) == 0 {
-		return nil
-	}
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	return db.applyOpsLocked(b.ops)
-}
-
-var (
-	// ErrTxClosed is returned when operating on a closed transaction.
-	ErrTxClosed = errors.New("leafdb: transaction closed")
-	// ErrTxReadOnly is returned when a write is attempted on a read-only transaction.
-	ErrTxReadOnly = errors.New("leafdb: read-only transaction")
-)
-
-// Tx represents a database transaction.
-type Tx struct {
-	db       *DB
-	writable bool
-	ops      []batchOp
-	closed   bool
-	snapshot *bptree
-	lockHeld bool
-}
-
-// Begin starts a transaction. Writable transactions lock the database exclusively.
-func (db *DB) Begin(writable bool) *Tx {
-	if db == nil {
-		return &Tx{closed: true}
-	}
-	if writable {
-		db.mu.Lock()
-		return &Tx{db: db, writable: true, lockHeld: true}
-	}
-	db.mu.RLock()
-	snap := db.index.snapshot()
-	db.mu.RUnlock()
-	return &Tx{db: db, snapshot: snap}
 }
 
 // View runs a read-only transaction.
@@ -259,92 +124,35 @@ func (db *DB) Update(fn func(*Tx) error) error {
 	return tx.Commit()
 }
 
-// Get returns the value for key within the transaction. The returned value is a copy.
-func (tx *Tx) Get(key []byte) ([]byte, bool) {
-	if tx == nil || tx.closed {
-		return nil, false
+// Begin starts a new transaction. Writable transactions are exclusive.
+func (db *DB) Begin(writable bool) *Tx {
+	if db == nil {
+		return &Tx{closed: true}
 	}
-	if tx.writable {
-		for i := len(tx.ops) - 1; i >= 0; i-- {
-			op := tx.ops[i]
-			if bytes.Equal(op.key, key) {
-				if op.del {
-					return nil, false
-				}
-				return cloneBytes(op.value), true
-			}
-		}
+	if writable {
+		db.mu.Lock()
+		mgr := newTxPageManager(db, true)
+		return &Tx{db: db, writable: true, mgr: mgr}
 	}
-	if !tx.writable && tx.snapshot != nil {
-		val, ok := tx.snapshot.get(key)
-		if !ok {
-			return nil, false
-		}
-		return cloneBytes(val), true
-	}
-	val, ok := tx.db.index.get(key)
-	if !ok {
-		return nil, false
-	}
-	return cloneBytes(val), true
+	db.mu.RLock()
+	mgr := newTxPageManager(db, false)
+	return &Tx{db: db, mgr: mgr}
 }
 
-// Set buffers a write in the transaction.
-func (tx *Tx) Set(key, value []byte) error {
-	if tx == nil || tx.closed {
-		return ErrTxClosed
+func (db *DB) page(id uint64) []byte {
+	start := int(id) * db.pageSize
+	end := start + db.pageSize
+	return db.data[start:end]
+}
+
+func (db *DB) remap(size int) error {
+	if err := db.data.Unmap(); err != nil {
+		return err
 	}
-	if !tx.writable {
-		return ErrTxReadOnly
+	data, err := mmap.MapRegion(db.file, size, mmap.RDWR, 0, 0)
+	if err != nil {
+		return err
 	}
-	tx.ops = append(tx.ops, batchOp{key: cloneBytes(key), value: cloneBytes(value)})
+	db.data = data
 	return nil
-}
-
-// Delete buffers a delete in the transaction.
-func (tx *Tx) Delete(key []byte) (bool, error) {
-	if tx == nil || tx.closed {
-		return false, ErrTxClosed
-	}
-	if !tx.writable {
-		return false, ErrTxReadOnly
-	}
-	_, exists := tx.Get(key)
-	if !exists {
-		return false, nil
-	}
-	tx.ops = append(tx.ops, batchOp{key: cloneBytes(key), del: true})
-	return true, nil
-}
-
-// Commit applies a writable transaction atomically.
-func (tx *Tx) Commit() error {
-	if tx == nil || tx.closed {
-		return ErrTxClosed
-	}
-	defer tx.close()
-	if !tx.writable {
-		return nil
-	}
-	return tx.db.applyOpsLocked(tx.ops)
-}
-
-// Rollback closes the transaction without applying changes.
-func (tx *Tx) Rollback() {
-	if tx == nil || tx.closed {
-		return
-	}
-	tx.close()
-}
-
-func (tx *Tx) close() {
-	if tx.closed {
-		return
-	}
-	tx.closed = true
-	if tx.writable {
-		tx.db.mu.Unlock()
-	} else if tx.lockHeld {
-		tx.db.mu.RUnlock()
-	}
 }
