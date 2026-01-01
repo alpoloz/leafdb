@@ -157,10 +157,11 @@ func (db *DB) snapshotMeta() meta {
 	db.metaMu.RLock()
 	defer db.metaMu.RUnlock()
 	return meta{
-		txid:     db.meta.txid,
-		root:     db.meta.root,
-		nextPage: db.meta.nextPage,
-		freelist: append([]uint64(nil), db.meta.freelist...),
+		txid:         db.meta.txid,
+		root:         db.meta.root,
+		nextPage:     db.meta.nextPage,
+		freelistPage: db.meta.freelistPage,
+		freelist:     append([]uint64(nil), db.meta.freelist...),
 	}
 }
 
@@ -276,7 +277,41 @@ func (db *DB) loadExisting() error {
 	if err != nil {
 		return err
 	}
+	if meta.freelistPage != 0 {
+		freeIDs, _, err := db.readFreelistChain(meta.freelistPage)
+		if err != nil {
+			return err
+		}
+		meta.freelist = append(meta.freelist, freeIDs...)
+	}
 	db.meta = meta
 	db.metaPage = metaPage
 	return nil
+}
+
+func (db *DB) readFreelistChain(pageID uint64) ([]uint64, []uint64, error) {
+	if pageID == 0 {
+		return nil, nil, nil
+	}
+	ids := make([]uint64, 0, 64)
+	pages := make([]uint64, 0, 8)
+	current := pageID
+	for current != 0 {
+		pages = append(pages, current)
+		next, pageIDs, err := readFreelistPage(db.page(current), db.pageSize)
+		if err != nil {
+			return nil, nil, err
+		}
+		ids = append(ids, pageIDs...)
+		current = next
+	}
+	return ids, pages, nil
+}
+
+func (db *DB) freelistPageIDs() ([]uint64, error) {
+	db.metaMu.RLock()
+	pageID := db.meta.freelistPage
+	db.metaMu.RUnlock()
+	_, pages, err := db.readFreelistChain(pageID)
+	return pages, err
 }

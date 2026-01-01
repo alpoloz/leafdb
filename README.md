@@ -37,7 +37,10 @@ func main() {
 		if err := bucket.Put([]byte("name"), []byte("leaf")); err != nil {
 			return err
 		}
-		return bucket.Put([]byte("version"), []byte("1"))
+		if err := bucket.Put([]byte("version"), []byte("1")); err != nil {
+			return err
+		}
+		return bucket.Delete([]byte("deprecated-key"))
 	}); err != nil {
 		log.Fatalf("update failed: %v", err)
 	}
@@ -69,7 +72,10 @@ err := db.Update(func(tx *leafdb.Tx) error {
 	if err != nil {
 		return err
 	}
-	return child.Put([]byte("k"), []byte("v"))
+	if err := child.Put([]byte("k"), []byte("v")); err != nil {
+		return err
+	}
+	return parent.DeleteBucket([]byte("old-child"))
 })
 if err != nil {
 	log.Fatalf("update failed: %v", err)
@@ -84,8 +90,10 @@ err = db.View(func(tx *leafdb.Tx) error {
 	if child == nil {
 		return fmt.Errorf("missing child")
 	}
-	val := child.Get([]byte("k"))
-	fmt.Printf("k=%s\n", val)
+	cursor := child.Cursor()
+	for k, v := cursor.First(); k != nil; k, v = cursor.Next() {
+		fmt.Printf("%s=%s\n", k, v)
+	}
 	return nil
 })
 if err != nil {

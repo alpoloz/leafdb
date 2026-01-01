@@ -50,9 +50,12 @@ func (b *Bucket) Delete(key []byte) error {
 		return ErrTxReadOnly
 	}
 	tree := newBPTree(&b.kvRoot, b.tx.mgr)
-	_, err := tree.delete(key)
+	deleted, err := tree.delete(key)
 	if err != nil {
 		return err
+	}
+	if !deleted {
+		return nil
 	}
 	return b.persistHeader()
 }
@@ -169,6 +172,7 @@ func (b *Bucket) NextSequence() (uint64, error) {
 }
 
 func (b *Bucket) persistHeader() error {
+	oldHeader := b.header
 	headID := b.tx.mgr.AllocPage()
 	if err := writeBucketHeader(b.tx.mgr, headID, b.kvRoot, b.bucketRoot, b.sequence); err != nil {
 		return err
@@ -181,9 +185,18 @@ func (b *Bucket) persistHeader() error {
 			return err
 		}
 		b.tx.mgr.root = root
+		if oldHeader != 0 {
+			b.tx.mgr.FreePage(oldHeader)
+		}
 		return nil
 	}
-	return b.parent.updateChild(b.name, headID)
+	if err := b.parent.updateChild(b.name, headID); err != nil {
+		return err
+	}
+	if oldHeader != 0 {
+		b.tx.mgr.FreePage(oldHeader)
+	}
+	return nil
 }
 
 func (b *Bucket) updateChild(name []byte, headerID uint64) error {

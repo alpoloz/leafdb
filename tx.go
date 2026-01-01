@@ -104,6 +104,7 @@ func (tx *Tx) Commit() error {
 		return ErrTxClosed
 	}
 	if !tx.writable {
+		tx.close()
 		return nil
 	}
 	if err := tx.mgr.commit(); err != nil {
@@ -291,13 +292,15 @@ func (m *txPageManager) WritePage(id uint64, buf []byte) error {
 }
 
 func (m *txPageManager) AllocPage() uint64 {
-	// MVCC safety: avoid reusing freed pages until a GC is added.
-	id := m.nextPage
-	m.nextPage++
-	if id > m.maxPage {
-		m.maxPage = id
+	if len(m.freelist) > 0 {
+		id := m.freelist[len(m.freelist)-1]
+		m.freelist = m.freelist[:len(m.freelist)-1]
+		if id > m.maxPage {
+			m.maxPage = id
+		}
+		return id
 	}
-	return id
+	return m.allocPageFromEnd()
 }
 
 func (m *txPageManager) FreePage(id uint64) {
@@ -328,6 +331,16 @@ func (m *txPageManager) commit() error {
 
 func (m *txPageManager) rollback() {
 	m.dirty = nil
+	m.pending = nil
+}
+
+func (m *txPageManager) allocPageFromEnd() uint64 {
+	id := m.nextPage
+	m.nextPage++
+	if id > m.maxPage {
+		m.maxPage = id
+	}
+	return id
 }
 
 func (m *txPageManager) ensureMapSize() error {
@@ -353,7 +366,20 @@ func (m *txPageManager) finalizeMeta() error {
 	nextMetaPage := m.nextMetaPage()
 	minRead, threshold := m.reuseThreshold(newMeta.txid)
 	reusable, remaining := m.collectReusable(newMeta.txid, minRead, threshold)
-	newMeta.freelist = append(m.freelist, reusable...)
+	// Avoid overwriting existing freelist pages before the meta page flips.
+	oldFreelistPages, err := m.db.freelistPageIDs()
+	if err != nil {
+		return err
+	}
+	free := append([]uint64(nil), m.freelist...)
+	free = append(free, reusable...)
+	free = append(free, oldFreelistPages...)
+	inlineFree, freelistPage, err := m.persistFreelist(free, oldFreelistPages)
+	if err != nil {
+		return err
+	}
+	newMeta.freelist = inlineFree
+	newMeta.freelistPage = freelistPage
 
 	m.db.metaMu.Lock()
 	defer m.db.metaMu.Unlock()
@@ -397,4 +423,85 @@ func (m *txPageManager) collectReusable(txid uint64, minRead uint64, threshold u
 		}
 	}
 	return reusable, remaining
+}
+
+func (m *txPageManager) persistFreelist(free []uint64, protected []uint64) ([]uint64, uint64, error) {
+	inlineCap := metaInlineFreeCapacity(m.pageSize)
+	if len(free) <= inlineCap {
+		return free, 0, nil
+	}
+	perPage := freelistPageCapacity(m.pageSize)
+	overflowCount := len(free) - inlineCap
+	pagesNeeded := (overflowCount + perPage) / (perPage + 1)
+
+	protectedSet := make(map[uint64]bool, len(protected))
+	for _, id := range protected {
+		protectedSet[id] = true
+	}
+
+	pageIDs := make([]uint64, 0, pagesNeeded)
+	selected := make(map[uint64]bool, pagesNeeded)
+	for i := len(free) - 1; i >= 0 && len(pageIDs) < pagesNeeded; i-- {
+		id := free[i]
+		if protectedSet[id] || selected[id] {
+			continue
+		}
+		pageIDs = append(pageIDs, id)
+		selected[id] = true
+	}
+	for len(pageIDs) < pagesNeeded {
+		id := m.allocPageFromEnd()
+		pageIDs = append(pageIDs, id)
+	}
+
+	if len(selected) > 0 {
+		kept := free[:0]
+		for _, id := range free {
+			if !selected[id] {
+				kept = append(kept, id)
+			}
+		}
+		free = kept
+	}
+
+	if len(free) <= inlineCap {
+		inlineCap = len(free)
+	}
+	inline := free[:inlineCap]
+	overflow := free[inlineCap:]
+	if len(overflow) > len(pageIDs)*perPage {
+		return nil, 0, errors.New("leafdb: freelist overflow")
+	}
+	if err := m.writeFreelistPages(pageIDs, overflow); err != nil {
+		return nil, 0, err
+	}
+	return inline, pageIDs[0], nil
+}
+
+func (m *txPageManager) writeFreelistPages(pageIDs []uint64, ids []uint64) error {
+	if len(pageIDs) == 0 {
+		return nil
+	}
+	perPage := freelistPageCapacity(m.pageSize)
+	index := 0
+	for i, pageID := range pageIDs {
+		next := uint64(0)
+		if i+1 < len(pageIDs) {
+			next = pageIDs[i+1]
+		}
+		end := index + perPage
+		if end > len(ids) {
+			end = len(ids)
+		}
+		chunk := ids[index:end]
+		index = end
+		buf := make([]byte, m.pageSize)
+		if err := writeFreelistPage(buf, chunk, next, m.pageSize); err != nil {
+			return err
+		}
+		if err := m.WritePage(pageID, buf); err != nil {
+			return err
+		}
+	}
+	return nil
 }

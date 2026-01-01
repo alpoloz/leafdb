@@ -18,6 +18,7 @@ file_offset = page_id * page_size
 - B+ tree leaf page
 - B+ tree branch page
 - Bucket header page
+- Freelist page (overflow free page IDs)
 
 ### File Layout Diagram
 
@@ -43,13 +44,17 @@ the meta page with the highest transaction ID for snapshot isolation.
 
 ```
 Offset  Size  Field
-0       4     Magic "LDB2"
+0       4     Magic "LDB3"
 4       4     Page size (uint32, little-endian)
 8       8     TxID (uint64)
 16      8     Root page ID (uint64) for top-level bucket index
 24      8     Next page ID (uint64) for allocation
-32      4     Freelist count (uint32)
-36      8*N   Freelist page IDs (uint64 each)
+32      8     Freelist page ID (uint64) for overflow pages
+40      4     Freelist count (uint32)
+44      8*N   Freelist page IDs (uint64 each)
+
+Older "LDB2" meta pages omit the freelist page pointer and place the freelist
+count at offset 32 with IDs starting at offset 36.
 ```
 
 ### Bucket Header Page
@@ -75,7 +80,8 @@ Offset  Size  Field
 0       1     Page type (1 = leaf, 2 = branch)
 1       2     Key count (uint16)
 3       8     Next leaf page ID (uint64, leaf only; 0 if none)
-11      ...   Body
+11      2     Reserved (padding)
+13      ...   Body
 ```
 
 Leaf body layout stores key/value pairs, each with length prefixes:
@@ -88,6 +94,19 @@ Branch body layout stores child pointers first, followed by separator keys:
 
 ```
 Child[0..N] (uint64 each), then Key[0..N-1] (uint16 + bytes)
+```
+
+### Freelist Pages
+
+Freelist overflow pages store free page IDs when the inline freelist in the
+meta page runs out of space.
+
+```
+Offset  Size  Field
+0       1     Page type = 4 (freelist)
+1       2     Entry count (uint16)
+3       8     Next freelist page ID (uint64, 0 if none)
+11      8*N   Free page IDs (uint64 each)
 ```
 
 ## Bucket Model
@@ -118,6 +137,7 @@ Child[0..N] (uint64 each), then Key[0..N-1] (uint16 + bytes)
 - **Separate trees per bucket**: Nested buckets are stored in a dedicated
   bucket-index tree rather than mixing bucket and KV keys.
 - **Freelist in meta page**: Reused only when safe under MVCC by tracking
-  active reader TxIDs and pending frees.
+  active reader TxIDs and pending frees; overflow IDs are stored in freelist
+  pages linked from the meta page.
 - **Cursor iteration**: Implemented by walking branch paths to avoid reliance
   on mutable leaf links.

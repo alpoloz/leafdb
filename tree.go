@@ -90,6 +90,7 @@ func (t *bptree) delete(key []byte) (bool, error) {
 	}
 	if root != nil && !root.isLeaf && len(root.keys) == 0 && len(root.children) == 1 {
 		*t.root = root.children[0]
+		t.store.FreePage(newID)
 		return true, nil
 	}
 	*t.root = newID
@@ -405,22 +406,37 @@ func cloneNode(n *node) *node {
 }
 
 func (t *bptree) insertLeaf(n *node, key, value []byte) (uint64, []byte, uint64, bool, error) {
+	oldID := n.pageID
 	newNode := cloneNode(n)
 	newNode.pageID = t.store.AllocPage()
 	idx, exists := findKeyIndex(newNode.keys, key)
 	if exists {
 		newNode.values[idx] = cloneBytes(value)
-		return newNode.pageID, nil, 0, false, t.writeNode(newNode)
+		if err := t.writeNode(newNode); err != nil {
+			return 0, nil, 0, false, err
+		}
+		t.store.FreePage(oldID)
+		return newNode.pageID, nil, 0, false, nil
 	}
 	insertAt(&newNode.keys, idx, cloneBytes(key))
 	insertAt(&newNode.values, idx, cloneBytes(value))
 	if nodeFits(t.store.PageSize(), newNode) {
-		return newNode.pageID, nil, 0, false, t.writeNode(newNode)
+		if err := t.writeNode(newNode); err != nil {
+			return 0, nil, 0, false, err
+		}
+		t.store.FreePage(oldID)
+		return newNode.pageID, nil, 0, false, nil
 	}
-	return t.splitLeaf(newNode)
+	newID, promoted, rightID, split, err := t.splitLeaf(newNode)
+	if err != nil {
+		return 0, nil, 0, false, err
+	}
+	t.store.FreePage(oldID)
+	return newID, promoted, rightID, split, nil
 }
 
 func (t *bptree) insertBranch(n *node, idx int, newChildID uint64, promoted []byte, rightID uint64, split bool) (uint64, []byte, uint64, bool, error) {
+	oldID := n.pageID
 	newNode := cloneNode(n)
 	newNode.pageID = t.store.AllocPage()
 	newNode.children[idx] = newChildID
@@ -429,9 +445,18 @@ func (t *bptree) insertBranch(n *node, idx int, newChildID uint64, promoted []by
 		insertAtUint64(&newNode.children, idx+1, rightID)
 	}
 	if nodeFits(t.store.PageSize(), newNode) {
-		return newNode.pageID, nil, 0, false, t.writeNode(newNode)
+		if err := t.writeNode(newNode); err != nil {
+			return 0, nil, 0, false, err
+		}
+		t.store.FreePage(oldID)
+		return newNode.pageID, nil, 0, false, nil
 	}
-	return t.splitBranch(newNode)
+	newID, newPromoted, newRightID, newSplit, err := t.splitBranch(newNode)
+	if err != nil {
+		return 0, nil, 0, false, err
+	}
+	t.store.FreePage(oldID)
+	return newID, newPromoted, newRightID, newSplit, nil
 }
 
 func (t *bptree) deleteLeaf(n *node, key []byte) (uint64, bool, error) {
@@ -439,18 +464,28 @@ func (t *bptree) deleteLeaf(n *node, key []byte) (uint64, bool, error) {
 	if !ok {
 		return n.pageID, false, nil
 	}
+	oldID := n.pageID
 	newNode := cloneNode(n)
 	newNode.pageID = t.store.AllocPage()
 	removeAt(&newNode.keys, idx)
 	removeAt(&newNode.values, idx)
-	return newNode.pageID, true, t.writeNode(newNode)
+	if err := t.writeNode(newNode); err != nil {
+		return 0, false, err
+	}
+	t.store.FreePage(oldID)
+	return newNode.pageID, true, nil
 }
 
 func (t *bptree) deleteBranch(n *node, idx int, newChildID uint64) (uint64, bool, error) {
+	oldID := n.pageID
 	newNode := cloneNode(n)
 	newNode.pageID = t.store.AllocPage()
 	newNode.children[idx] = newChildID
-	return newNode.pageID, true, t.writeNode(newNode)
+	if err := t.writeNode(newNode); err != nil {
+		return 0, false, err
+	}
+	t.store.FreePage(oldID)
+	return newNode.pageID, true, nil
 }
 
 func (t *bptree) writeNode(n *node) error {
