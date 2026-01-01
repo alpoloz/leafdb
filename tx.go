@@ -192,6 +192,7 @@ func freeTree(store pageStore, rootID uint64) {
 			freeTree(store, child)
 		}
 	}
+	freeNodeOverflow(store, node)
 	store.FreePage(rootID)
 }
 

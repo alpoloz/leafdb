@@ -26,7 +26,11 @@ type node struct {
 	values   [][]byte
 	children []uint64
 	next     uint64
+	overflow []uint64
 }
+
+const valueOverflowFlag = uint32(1 << 31)
+const maxValueLength = int(^valueOverflowFlag)
 
 type cursorFrame struct {
 	node  *node
@@ -158,19 +162,10 @@ func (t *bptree) splitLeaf(n *node) (uint64, []byte, uint64, bool, error) {
 	n.values = n.values[:mid]
 	n.next = right.pageID
 
-	leftBuf, err := encodeNodePage(t.store.PageSize(), n)
-	if err != nil {
+	if err := t.writeNode(n); err != nil {
 		return 0, nil, 0, false, err
 	}
-	if err := t.store.WritePage(n.pageID, leftBuf); err != nil {
-		return 0, nil, 0, false, err
-	}
-
-	rightBuf, err := encodeNodePage(t.store.PageSize(), right)
-	if err != nil {
-		return 0, nil, 0, false, err
-	}
-	if err := t.store.WritePage(right.pageID, rightBuf); err != nil {
+	if err := t.writeNode(right); err != nil {
 		return 0, nil, 0, false, err
 	}
 	return n.pageID, cloneBytes(right.keys[0]), right.pageID, true, nil
@@ -190,19 +185,10 @@ func (t *bptree) splitBranch(n *node) (uint64, []byte, uint64, bool, error) {
 	n.keys = n.keys[:mid]
 	n.children = n.children[:mid+1]
 
-	leftBuf, err := encodeNodePage(t.store.PageSize(), n)
-	if err != nil {
+	if err := t.writeNode(n); err != nil {
 		return 0, nil, 0, false, err
 	}
-	if err := t.store.WritePage(n.pageID, leftBuf); err != nil {
-		return 0, nil, 0, false, err
-	}
-
-	rightBuf, err := encodeNodePage(t.store.PageSize(), right)
-	if err != nil {
-		return 0, nil, 0, false, err
-	}
-	if err := t.store.WritePage(right.pageID, rightBuf); err != nil {
+	if err := t.writeNode(right); err != nil {
 		return 0, nil, 0, false, err
 	}
 
@@ -245,7 +231,7 @@ func readNode(store pageStore, pageID uint64) (*node, error) {
 
 	switch kind {
 	case pageLeaf:
-		return decodeLeafNode(pageID, next, keyCount, buf, pos)
+		return decodeLeafNode(store, pageID, next, keyCount, buf, pos)
 	case pageBranch:
 		return decodeBranchNode(pageID, keyCount, buf, pos)
 	default:
@@ -267,7 +253,11 @@ func nodeFits(pageSize int, n *node) bool {
 	size := nodeHeaderSize
 	if n.isLeaf {
 		for i, key := range n.keys {
-			size += 2 + len(key) + 4 + len(n.values[i])
+			entrySize, _, err := leafEntrySize(key, n.values[i], pageSize)
+			if err != nil {
+				return false
+			}
+			size += entrySize
 		}
 		return size <= pageSize
 	}
@@ -276,6 +266,21 @@ func nodeFits(pageSize int, n *node) bool {
 		size += 2 + len(key)
 	}
 	return size <= pageSize
+}
+
+func leafEntrySize(key, value []byte, pageSize int) (int, bool, error) {
+	if len(value) > maxValueLength {
+		return 0, false, errors.New("leafdb: value too large")
+	}
+	inlineSize := 2 + len(key) + 4 + len(value)
+	if nodeHeaderSize+inlineSize <= pageSize {
+		return inlineSize, false, nil
+	}
+	overflowSize := 2 + len(key) + 4 + 8
+	if nodeHeaderSize+overflowSize > pageSize {
+		return 0, false, errors.New("leafdb: key too large")
+	}
+	return overflowSize, true, nil
 }
 
 func findChildIndex(keys [][]byte, key []byte) int {
@@ -323,6 +328,21 @@ func writeKeyValue(buf []byte, pos int, key, value []byte) (int, error) {
 	return pos, nil
 }
 
+func writeOverflowEntry(buf []byte, pos int, key []byte, valueLen uint32, overflowID uint64) (int, error) {
+	if pos+2+len(key)+4+8 > len(buf) {
+		return pos, errors.New("leafdb: node too large for page")
+	}
+	binary.LittleEndian.PutUint16(buf[pos:], uint16(len(key)))
+	pos += 2
+	copy(buf[pos:], key)
+	pos += len(key)
+	binary.LittleEndian.PutUint32(buf[pos:], valueLen|valueOverflowFlag)
+	pos += 4
+	binary.LittleEndian.PutUint64(buf[pos:], overflowID)
+	pos += 8
+	return pos, nil
+}
+
 func writeKey(buf []byte, pos int, key []byte) (int, error) {
 	if pos+2+len(key) > len(buf) {
 		return pos, errors.New("leafdb: node too large for page")
@@ -349,19 +369,101 @@ func readKey(buf []byte, pos int) ([]byte, int, error) {
 	return key, pos, nil
 }
 
-func readValue(buf []byte, pos int) ([]byte, int, error) {
-	if pos+4 > len(buf) {
-		return nil, pos, errors.New("leafdb: corrupted value length")
+func readOverflowPages(store pageStore, first uint64, length uint32) ([]byte, error) {
+	if first == 0 || length == 0 {
+		return []byte{}, nil
 	}
-	length := int(binary.LittleEndian.Uint32(buf[pos:]))
-	pos += 4
-	if pos+length > len(buf) {
-		return nil, pos, errors.New("leafdb: corrupted value data")
+	pageSize := store.PageSize()
+	payload := pageSize - overflowHeaderSize
+	out := make([]byte, length)
+	remaining := int(length)
+	offset := 0
+	pageID := first
+	for remaining > 0 {
+		buf, err := store.ReadPage(pageID)
+		if err != nil {
+			return nil, err
+		}
+		if len(buf) < pageSize {
+			return nil, errors.New("leafdb: invalid overflow page")
+		}
+		if buf[0] != pageOverflow {
+			return nil, errors.New("leafdb: invalid overflow page")
+		}
+		next := binary.LittleEndian.Uint64(buf[1:])
+		chunk := remaining
+		if chunk > payload {
+			chunk = payload
+		}
+		copy(out[offset:], buf[overflowHeaderSize:overflowHeaderSize+chunk])
+		offset += chunk
+		remaining -= chunk
+		pageID = next
+		if remaining > 0 && pageID == 0 {
+			return nil, errors.New("leafdb: overflow chain too short")
+		}
 	}
-	value := make([]byte, length)
-	copy(value, buf[pos:pos+length])
-	pos += length
-	return value, pos, nil
+	return out, nil
+}
+
+func writeOverflowPages(store pageStore, value []byte) (uint64, error) {
+	pageSize := store.PageSize()
+	payload := pageSize - overflowHeaderSize
+	pagesNeeded := (len(value) + payload - 1) / payload
+	ids := make([]uint64, pagesNeeded)
+	for i := 0; i < pagesNeeded; i++ {
+		ids[i] = store.AllocPage()
+	}
+	offset := 0
+	for i, id := range ids {
+		next := uint64(0)
+		if i+1 < len(ids) {
+			next = ids[i+1]
+		}
+		buf := make([]byte, pageSize)
+		buf[0] = pageOverflow
+		binary.LittleEndian.PutUint64(buf[1:], next)
+		end := offset + payload
+		if end > len(value) {
+			end = len(value)
+		}
+		copy(buf[overflowHeaderSize:], value[offset:end])
+		offset = end
+		if err := store.WritePage(id, buf); err != nil {
+			for _, freeID := range ids {
+				store.FreePage(freeID)
+			}
+			return 0, err
+		}
+	}
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	return ids[0], nil
+}
+
+func freeOverflowPages(store pageStore, first uint64) {
+	pageID := first
+	for pageID != 0 {
+		buf, err := store.ReadPage(pageID)
+		if err != nil || len(buf) < store.PageSize() || buf[0] != pageOverflow {
+			return
+		}
+		next := binary.LittleEndian.Uint64(buf[1:])
+		store.FreePage(pageID)
+		pageID = next
+	}
+}
+
+func freeNodeOverflow(store pageStore, n *node) {
+	if n == nil || !n.isLeaf || len(n.overflow) == 0 {
+		return
+	}
+	for _, id := range n.overflow {
+		if id != 0 {
+			freeOverflowPages(store, id)
+		}
+	}
 }
 
 func insertAt[T any](slice *[]T, idx int, value T) {
@@ -406,6 +508,9 @@ func cloneNode(n *node) *node {
 }
 
 func (t *bptree) insertLeaf(n *node, key, value []byte) (uint64, []byte, uint64, bool, error) {
+	if _, _, err := leafEntrySize(key, value, t.store.PageSize()); err != nil {
+		return 0, nil, 0, false, err
+	}
 	oldID := n.pageID
 	newNode := cloneNode(n)
 	newNode.pageID = t.store.AllocPage()
@@ -415,6 +520,7 @@ func (t *bptree) insertLeaf(n *node, key, value []byte) (uint64, []byte, uint64,
 		if err := t.writeNode(newNode); err != nil {
 			return 0, nil, 0, false, err
 		}
+		freeNodeOverflow(t.store, n)
 		t.store.FreePage(oldID)
 		return newNode.pageID, nil, 0, false, nil
 	}
@@ -424,6 +530,7 @@ func (t *bptree) insertLeaf(n *node, key, value []byte) (uint64, []byte, uint64,
 		if err := t.writeNode(newNode); err != nil {
 			return 0, nil, 0, false, err
 		}
+		freeNodeOverflow(t.store, n)
 		t.store.FreePage(oldID)
 		return newNode.pageID, nil, 0, false, nil
 	}
@@ -431,6 +538,7 @@ func (t *bptree) insertLeaf(n *node, key, value []byte) (uint64, []byte, uint64,
 	if err != nil {
 		return 0, nil, 0, false, err
 	}
+	freeNodeOverflow(t.store, n)
 	t.store.FreePage(oldID)
 	return newID, promoted, rightID, split, nil
 }
@@ -472,6 +580,7 @@ func (t *bptree) deleteLeaf(n *node, key []byte) (uint64, bool, error) {
 	if err := t.writeNode(newNode); err != nil {
 		return 0, false, err
 	}
+	freeNodeOverflow(t.store, n)
 	t.store.FreePage(oldID)
 	return newNode.pageID, true, nil
 }
@@ -489,27 +598,60 @@ func (t *bptree) deleteBranch(n *node, idx int, newChildID uint64) (uint64, bool
 }
 
 func (t *bptree) writeNode(n *node) error {
-	buf, err := encodeNodePage(t.store.PageSize(), n)
+	var (
+		buf []byte
+		err error
+	)
+	if n.isLeaf {
+		buf, err = encodeLeafPageWithOverflow(t.store, n)
+	} else {
+		buf, err = encodeNodePage(t.store.PageSize(), n)
+	}
 	if err != nil {
 		return err
 	}
 	return t.store.WritePage(n.pageID, buf)
 }
 
-func decodeLeafNode(pageID uint64, next uint64, keyCount int, buf []byte, pos int) (*node, error) {
+func decodeLeafNode(store pageStore, pageID uint64, next uint64, keyCount int, buf []byte, pos int) (*node, error) {
 	n := &node{pageID: pageID, isLeaf: true, next: next}
 	n.keys = make([][]byte, keyCount)
 	n.values = make([][]byte, keyCount)
+	n.overflow = make([]uint64, keyCount)
 	for i := 0; i < keyCount; i++ {
 		var err error
 		n.keys[i], pos, err = readKey(buf, pos)
 		if err != nil {
 			return nil, err
 		}
-		n.values[i], pos, err = readValue(buf, pos)
-		if err != nil {
-			return nil, err
+		if pos+4 > len(buf) {
+			return nil, errors.New("leafdb: corrupted value length")
 		}
+		length := binary.LittleEndian.Uint32(buf[pos:])
+		pos += 4
+		overflow := length&valueOverflowFlag != 0
+		length &= ^valueOverflowFlag
+		if overflow {
+			if pos+8 > len(buf) {
+				return nil, errors.New("leafdb: corrupted overflow pointer")
+			}
+			overflowID := binary.LittleEndian.Uint64(buf[pos:])
+			pos += 8
+			value, err := readOverflowPages(store, overflowID, length)
+			if err != nil {
+				return nil, err
+			}
+			n.values[i] = value
+			n.overflow[i] = overflowID
+			continue
+		}
+		if pos+int(length) > len(buf) {
+			return nil, errors.New("leafdb: corrupted value data")
+		}
+		value := make([]byte, length)
+		copy(value, buf[pos:pos+int(length)])
+		pos += int(length)
+		n.values[i] = value
 	}
 	return n, nil
 }
@@ -543,6 +685,41 @@ func encodeLeafPage(buf []byte, n *node) ([]byte, error) {
 	for i, key := range n.keys {
 		var err error
 		pos, err = writeKeyValue(buf, pos, key, n.values[i])
+		if err != nil {
+			return nil, err
+		}
+	}
+	return buf, nil
+}
+
+func encodeLeafPageWithOverflow(store pageStore, n *node) ([]byte, error) {
+	pageSize := store.PageSize()
+	buf := make([]byte, pageSize)
+	buf[0] = pageLeaf
+	binary.LittleEndian.PutUint16(buf[1:], uint16(len(n.keys)))
+	binary.LittleEndian.PutUint64(buf[3:], n.next)
+	pos := nodeHeaderSize
+	for i, key := range n.keys {
+		value := n.values[i]
+		entrySize, overflow, err := leafEntrySize(key, value, pageSize)
+		if err != nil {
+			return nil, err
+		}
+		if pos+entrySize > len(buf) {
+			return nil, errors.New("leafdb: node too large for page")
+		}
+		if overflow {
+			overflowID, err := writeOverflowPages(store, value)
+			if err != nil {
+				return nil, err
+			}
+			pos, err = writeOverflowEntry(buf, pos, key, uint32(len(value)), overflowID)
+			if err != nil {
+				return nil, err
+			}
+			continue
+		}
+		pos, err = writeKeyValue(buf, pos, key, value)
 		if err != nil {
 			return nil, err
 		}

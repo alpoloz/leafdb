@@ -15,8 +15,10 @@ const (
 	pageBranch         = 2
 	pageBucket         = 3
 	pageFreelist       = 4
+	pageOverflow       = 5
 	nodeHeaderSize     = 13
 	freelistHeaderSize = 11
+	overflowHeaderSize = 9
 	metaHeaderSizeV2   = 36
 	metaHeaderSizeV3   = 44
 )

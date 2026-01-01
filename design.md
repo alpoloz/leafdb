@@ -19,6 +19,7 @@ file_offset = page_id * page_size
 - B+ tree branch page
 - Bucket header page
 - Freelist page (overflow free page IDs)
+- Overflow page (large values)
 
 ### File Layout Diagram
 
@@ -84,10 +85,12 @@ Offset  Size  Field
 13      ...   Body
 ```
 
-Leaf body layout stores key/value pairs, each with length prefixes:
+Leaf body layout stores key/value pairs, each with length prefixes. If the
+high bit of `ValLen` is set, the value is stored in overflow pages and the
+inline value is an 8-byte overflow page ID.
 
 ```
-KeyLen (uint16) | Key | ValLen (uint32) | Value
+KeyLen (uint16) | Key | ValLen (uint32) | Value or OverflowPageID (uint64)
 ```
 
 Branch body layout stores child pointers first, followed by separator keys:
@@ -107,6 +110,17 @@ Offset  Size  Field
 1       2     Entry count (uint16)
 3       8     Next freelist page ID (uint64, 0 if none)
 11      8*N   Free page IDs (uint64 each)
+```
+
+### Overflow Pages
+
+Overflow pages store large values that do not fit within a single leaf page.
+
+```
+Offset  Size  Field
+0       1     Page type = 5 (overflow)
+1       8     Next overflow page ID (uint64, 0 if none)
+9       ...   Raw value bytes
 ```
 
 ## Bucket Model

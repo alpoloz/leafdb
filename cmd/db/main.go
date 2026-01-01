@@ -14,7 +14,7 @@ func main() {
 	}
 	defer db.Close()
 
-	if err := db.Update(func(tx *leafdb.Tx) error {
+	if err := db.Write(func(tx *leafdb.Tx) error {
 		bucket, err := tx.CreateBucketIfNotExists([]byte("config"))
 		if err != nil {
 			return err
@@ -34,7 +34,7 @@ func main() {
 		log.Fatalf("update failed: %v", err)
 	}
 
-	if err := db.View(func(tx *leafdb.Tx) error {
+	if err := db.Read(func(tx *leafdb.Tx) error {
 		bucket := tx.Bucket([]byte("config"))
 		if bucket == nil {
 			return fmt.Errorf("missing bucket")

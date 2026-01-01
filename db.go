@@ -83,22 +83,22 @@ func (db *DB) Close() error {
 	return nil
 }
 
-// View runs a read-only transaction.
-func (db *DB) View(fn func(*Tx) error) error {
+// Read runs a read-only transaction.
+func (db *DB) Read(fn func(*Tx) error) error {
 	if fn == nil {
 		return nil
 	}
-	tx := db.Begin(false)
+	tx := db.begin(false)
 	defer tx.Rollback()
 	return fn(tx)
 }
 
-// Update runs a read-write transaction.
-func (db *DB) Update(fn func(*Tx) error) error {
+// Write runs a read-write transaction.
+func (db *DB) Write(fn func(*Tx) error) error {
 	if fn == nil {
 		return nil
 	}
-	tx := db.Begin(true)
+	tx := db.begin(true)
 	if err := fn(tx); err != nil {
 		tx.Rollback()
 		return err
@@ -106,8 +106,8 @@ func (db *DB) Update(fn func(*Tx) error) error {
 	return tx.Commit()
 }
 
-// Begin starts a new transaction. Writable transactions are exclusive.
-func (db *DB) Begin(writable bool) *Tx {
+// begin starts a new transaction. Writable transactions are exclusive.
+func (db *DB) begin(writable bool) *Tx {
 	if db == nil {
 		return &Tx{closed: true}
 	}
