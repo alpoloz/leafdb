@@ -5,7 +5,7 @@ import (
 	"os"
 	"sync"
 
-	"github.com/edsrzf/mmap-go"
+	"golang.org/x/sys/unix"
 )
 
 var (
@@ -18,7 +18,7 @@ var (
 // DB is a memory-mapped key/value store with B+ tree pages on disk.
 type DB struct {
 	file     *os.File
-	data     mmap.MMap
+	data     []byte
 	pageSize int
 	meta     meta
 	metaPage uint64
@@ -72,8 +72,10 @@ func (db *DB) Close() error {
 	defer db.mu.Unlock()
 	if db.data != nil {
 		db.mapMu.Lock()
-		_ = db.data.Flush()
-		_ = db.data.Unmap()
+		if len(db.data) > 0 {
+			_ = unix.Msync(db.data, unix.MS_SYNC)
+		}
+		_ = unix.Munmap(db.data)
 		db.mapMu.Unlock()
 		db.data = nil
 	}
@@ -133,10 +135,12 @@ func (db *DB) page(id uint64) []byte {
 func (db *DB) remap(size int) error {
 	db.mapMu.Lock()
 	defer db.mapMu.Unlock()
-	if err := db.data.Unmap(); err != nil {
-		return err
+	if db.data != nil {
+		if err := unix.Munmap(db.data); err != nil {
+			return err
+		}
 	}
-	data, err := mmap.MapRegion(db.file, size, mmap.RDWR, 0, 0)
+	data, err := unix.Mmap(int(db.file.Fd()), 0, size, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)
 	if err != nil {
 		return err
 	}
@@ -147,10 +151,10 @@ func (db *DB) remap(size int) error {
 func (db *DB) msync() error {
 	db.mapMu.RLock()
 	defer db.mapMu.RUnlock()
-	if db.data == nil {
+	if db.data == nil || len(db.data) == 0 {
 		return nil
 	}
-	return db.data.Flush()
+	return unix.Msync(db.data, unix.MS_SYNC)
 }
 
 func (db *DB) snapshotMeta() meta {
@@ -242,7 +246,18 @@ func openFile(path string) (*os.File, os.FileInfo, error) {
 }
 
 func mapFile(file *os.File) (*DB, error) {
-	data, err := mmap.MapRegion(file, -1, mmap.RDWR, 0, 0)
+	info, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	size := info.Size()
+	if size <= 0 {
+		return nil, errors.New("leafdb: invalid file size")
+	}
+	if size > int64(int(^uint(0)>>1)) {
+		return nil, errors.New("leafdb: file too large to mmap")
+	}
+	data, err := unix.Mmap(int(file.Fd()), 0, int(size), unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)
 	if err != nil {
 		return nil, err
 	}
@@ -269,7 +284,7 @@ func (db *DB) initEmpty() error {
 	if err := writeMetaPage(db.page(metaPage1), empty, db.pageSize); err != nil {
 		return err
 	}
-	return db.data.Flush()
+	return db.msync()
 }
 
 func (db *DB) loadExisting() error {

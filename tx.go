@@ -3,6 +3,8 @@ package leafdb
 import (
 	"encoding/binary"
 	"errors"
+
+	"golang.org/x/sys/unix"
 )
 
 type Tx struct {
@@ -327,7 +329,10 @@ func (m *txPageManager) commit() error {
 	if err := m.db.msync(); err != nil {
 		return err
 	}
-	return fdatasync(m.db.file)
+	if m.db.file == nil {
+		return nil
+	}
+	return unix.Fsync(int(m.db.file.Fd()))
 }
 
 func (m *txPageManager) rollback() {
