@@ -1,7 +1,7 @@
 # leafdb
 Leafdb is a small Go key/value store backed by a B+ tree stored on disk via
-memory-mapped pages. It uses Bolt-style buckets, nested buckets, and
-single-writer/multi-reader transactions.
+memory-mapped pages. It uses buckets, nested buckets, and single-writer/
+multi-reader transactions.
 
 ## Features
 - Memory-mapped, page-based B+ tree storage
@@ -42,7 +42,7 @@ func main() {
 		}
 		return bucket.Delete([]byte("deprecated-key"))
 	}); err != nil {
-		log.Fatalf("update failed: %v", err)
+		log.Fatalf("write failed: %v", err)
 	}
 
 	if err := db.Read(func(tx *leafdb.Tx) error {
@@ -54,50 +54,9 @@ func main() {
 		fmt.Printf("name=%s\n", val)
 		return nil
 	}); err != nil {
-		log.Fatalf("view failed: %v", err)
+		log.Fatalf("read failed: %v", err)
 	}
 
-}
-```
-
-## Transactions and Buckets
-
-```go
-err := db.Write(func(tx *leafdb.Tx) error {
-	parent, err := tx.CreateBucketIfNotExists([]byte("parent"))
-	if err != nil {
-		return err
-	}
-	child, err := parent.CreateBucketIfNotExists([]byte("child"))
-	if err != nil {
-		return err
-	}
-	if err := child.Put([]byte("k"), []byte("v")); err != nil {
-		return err
-	}
-	return parent.DeleteBucket([]byte("old-child"))
-})
-if err != nil {
-	log.Fatalf("update failed: %v", err)
-}
-
-err = db.Read(func(tx *leafdb.Tx) error {
-	parent := tx.Bucket([]byte("parent"))
-	if parent == nil {
-		return fmt.Errorf("missing parent")
-	}
-	child := parent.Bucket([]byte("child"))
-	if child == nil {
-		return fmt.Errorf("missing child")
-	}
-	cursor := child.Cursor()
-	for k, v := cursor.First(); k != nil; k, v = cursor.Next() {
-		fmt.Printf("%s=%s\n", k, v)
-	}
-	return nil
-})
-if err != nil {
-	log.Fatalf("view failed: %v", err)
 }
 ```
 
