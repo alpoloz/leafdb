@@ -33,20 +33,16 @@ func (c *Cursor) Next() ([]byte, []byte) {
 		return cloneBytes(c.leaf.keys[c.index]), cloneBytes(c.leaf.values[c.index])
 	}
 
-	for len(c.stack) > 0 {
-		idx := len(c.stack) - 1
-		frame := &c.stack[idx]
-		if frame.index+1 < len(frame.node.children) {
-			frame.index++
-			leaf, err := c.descendLeft(frame.node.children[frame.index])
-			if err != nil || leaf == nil || len(leaf.keys) == 0 {
-				return nil, nil
-			}
-			c.leaf = leaf
-			c.index = 0
+	for c.leaf.next != 0 {
+		leaf, err := readNode(c.tree.store, c.leaf.next)
+		if err != nil || leaf == nil || !leaf.isLeaf {
+			return nil, nil
+		}
+		c.leaf = leaf
+		c.index = 0
+		if len(leaf.keys) > 0 {
 			return cloneBytes(leaf.keys[0]), cloneBytes(leaf.values[0])
 		}
-		c.stack = c.stack[:idx]
 	}
 	return nil, nil
 }
