@@ -590,11 +590,197 @@ func (t *bptree) deleteBranch(n *node, idx int, newChildID uint64) (uint64, bool
 	newNode := cloneNode(n)
 	newNode.pageID = t.store.AllocPage()
 	newNode.children[idx] = newChildID
+
+	child, err := readNode(t.store, newChildID)
+	if err != nil {
+		return 0, false, err
+	}
+	if child != nil && nodeUnderflow(child) {
+		if err := t.rebalanceChild(newNode, idx, child); err != nil {
+			return 0, false, err
+		}
+	}
 	if err := t.writeNode(newNode); err != nil {
 		return 0, false, err
 	}
 	t.store.FreePage(oldID)
 	return newNode.pageID, true, nil
+}
+
+func nodeUnderflow(n *node) bool {
+	if n == nil {
+		return false
+	}
+	if n.isLeaf {
+		return len(n.keys) == 0
+	}
+	return len(n.children) < 2
+}
+
+func nodeCanSpare(n *node) bool {
+	if n == nil {
+		return false
+	}
+	if n.isLeaf {
+		return len(n.keys) > 1
+	}
+	return len(n.children) > 2
+}
+
+func (t *bptree) rebalanceChild(parent *node, idx int, child *node) error {
+	if idx > 0 {
+		left, err := readNode(t.store, parent.children[idx-1])
+		if err != nil {
+			return err
+		}
+		if left.isLeaf != child.isLeaf {
+			return errors.New("leafdb: invalid tree state")
+		}
+		if nodeCanSpare(left) {
+			return t.borrowFromLeft(parent, idx, left, child)
+		}
+	}
+	if idx+1 < len(parent.children) {
+		right, err := readNode(t.store, parent.children[idx+1])
+		if err != nil {
+			return err
+		}
+		if right.isLeaf != child.isLeaf {
+			return errors.New("leafdb: invalid tree state")
+		}
+		if nodeCanSpare(right) {
+			return t.borrowFromRight(parent, idx, child, right)
+		}
+	}
+	if idx > 0 {
+		left, err := readNode(t.store, parent.children[idx-1])
+		if err != nil {
+			return err
+		}
+		if left.isLeaf != child.isLeaf {
+			return errors.New("leafdb: invalid tree state")
+		}
+		return t.mergeChildren(parent, idx-1, left, child)
+	}
+	if idx+1 < len(parent.children) {
+		right, err := readNode(t.store, parent.children[idx+1])
+		if err != nil {
+			return err
+		}
+		if right.isLeaf != child.isLeaf {
+			return errors.New("leafdb: invalid tree state")
+		}
+		return t.mergeChildren(parent, idx, child, right)
+	}
+	return nil
+}
+
+func (t *bptree) borrowFromLeft(parent *node, idx int, left, child *node) error {
+	leftNew := cloneNode(left)
+	leftNew.pageID = t.store.AllocPage()
+	childNew := cloneNode(child)
+	childNew.pageID = t.store.AllocPage()
+
+	if childNew.isLeaf {
+		moveKey := leftNew.keys[len(leftNew.keys)-1]
+		moveVal := leftNew.values[len(leftNew.values)-1]
+		leftNew.keys = leftNew.keys[:len(leftNew.keys)-1]
+		leftNew.values = leftNew.values[:len(leftNew.values)-1]
+		insertAt(&childNew.keys, 0, moveKey)
+		insertAt(&childNew.values, 0, moveVal)
+		parent.keys[idx-1] = cloneBytes(childNew.keys[0])
+	} else {
+		sep := parent.keys[idx-1]
+		moveKey := leftNew.keys[len(leftNew.keys)-1]
+		moveChild := leftNew.children[len(leftNew.children)-1]
+		leftNew.keys = leftNew.keys[:len(leftNew.keys)-1]
+		leftNew.children = leftNew.children[:len(leftNew.children)-1]
+		insertAt(&childNew.keys, 0, cloneBytes(sep))
+		insertAtUint64(&childNew.children, 0, moveChild)
+		parent.keys[idx-1] = cloneBytes(moveKey)
+	}
+
+	if err := t.writeNode(leftNew); err != nil {
+		return err
+	}
+	if err := t.writeNode(childNew); err != nil {
+		return err
+	}
+	parent.children[idx-1] = leftNew.pageID
+	parent.children[idx] = childNew.pageID
+	t.store.FreePage(left.pageID)
+	t.store.FreePage(child.pageID)
+	return nil
+}
+
+func (t *bptree) borrowFromRight(parent *node, idx int, child, right *node) error {
+	childNew := cloneNode(child)
+	childNew.pageID = t.store.AllocPage()
+	rightNew := cloneNode(right)
+	rightNew.pageID = t.store.AllocPage()
+
+	if childNew.isLeaf {
+		moveKey := rightNew.keys[0]
+		moveVal := rightNew.values[0]
+		removeAt(&rightNew.keys, 0)
+		removeAt(&rightNew.values, 0)
+		childNew.keys = append(childNew.keys, moveKey)
+		childNew.values = append(childNew.values, moveVal)
+		parent.keys[idx] = cloneBytes(rightNew.keys[0])
+	} else {
+		sep := parent.keys[idx]
+		moveKey := rightNew.keys[0]
+		moveChild := rightNew.children[0]
+		removeAt(&rightNew.keys, 0)
+		removeAt(&rightNew.children, 0)
+		childNew.keys = append(childNew.keys, cloneBytes(sep))
+		childNew.children = append(childNew.children, moveChild)
+		parent.keys[idx] = cloneBytes(moveKey)
+	}
+
+	if err := t.writeNode(childNew); err != nil {
+		return err
+	}
+	if err := t.writeNode(rightNew); err != nil {
+		return err
+	}
+	parent.children[idx] = childNew.pageID
+	parent.children[idx+1] = rightNew.pageID
+	t.store.FreePage(child.pageID)
+	t.store.FreePage(right.pageID)
+	return nil
+}
+
+func (t *bptree) mergeChildren(parent *node, sepIdx int, left, right *node) error {
+	merged := &node{
+		pageID: t.store.AllocPage(),
+		isLeaf: left.isLeaf,
+	}
+	if left.isLeaf {
+		merged.keys = append(merged.keys, left.keys...)
+		merged.keys = append(merged.keys, right.keys...)
+		merged.values = append(merged.values, left.values...)
+		merged.values = append(merged.values, right.values...)
+		merged.next = right.next
+	} else {
+		merged.keys = append(merged.keys, left.keys...)
+		merged.keys = append(merged.keys, cloneBytes(parent.keys[sepIdx]))
+		merged.keys = append(merged.keys, right.keys...)
+		merged.children = append(merged.children, left.children...)
+		merged.children = append(merged.children, right.children...)
+	}
+	if !nodeFits(t.store.PageSize(), merged) {
+		return nil
+	}
+	if err := t.writeNode(merged); err != nil {
+		return err
+	}
+	parent.children[sepIdx] = merged.pageID
+	removeAt(&parent.children, sepIdx+1)
+	removeAt(&parent.keys, sepIdx)
+	t.store.FreePage(left.pageID)
+	t.store.FreePage(right.pageID)
+	return nil
 }
 
 func (t *bptree) writeNode(n *node) error {
